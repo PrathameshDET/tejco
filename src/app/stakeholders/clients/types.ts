@@ -22,6 +22,27 @@ export interface ClientBranch {
   contacts: ClientContact[]
 }
 
+export interface CreateClientPayload {
+  clientId: number
+  name: string
+  company: string
+  contactPerson: string
+  email: string
+  phone: string
+  status: string
+  clientType: string
+  doctorSpeciality: string
+  hasBranches: boolean
+  gstin: string
+  joinedDate: string
+  instagramUrl: string
+  dateOfBirth: string | null
+  billingAddress: Address
+  shippingAddress: Address
+  contacts: ClientContact[]
+  branches: ClientBranch[]
+}
+
 export type ClientType = "Clinic" | "Doctor" | "Hospital" | "Retail" | "Others"
 
 export interface Client {
@@ -33,6 +54,7 @@ export interface Client {
   phone: string
   status: "Active" | "Inactive" | "Lead"
   clientType: ClientType
+  doctorSpeciality?: string
   hasBranches: boolean
   branches: ClientBranch[]
   joinedDate: string
@@ -41,6 +63,8 @@ export interface Client {
   shippingAddress: Address
   gstin?: string
   contacts: ClientContact[]
+  instagramUrl?: string
+  dateOfBirth?: string
 }
 
 export interface ClientDelivery {

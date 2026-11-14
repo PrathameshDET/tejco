@@ -1,7 +1,6 @@
-"use client"
 
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useNavigate } from "react-router-dom"
 import { ArrowLeft, Save, X, Plus, Trash2, Package, Tag, IndianRupee, Layers, Barcode, RefreshCcw, ImageIcon, UploadCloud } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -14,18 +13,24 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import {
-    Select,
-    SelectContent,
-    SelectItem,
-    SelectTrigger,
-    SelectValue,
-} from "@/components/ui/select"
+import { SearchableDropdown, SearchableOption } from "@/components/common/searchable-dropdown"
 import { Textarea } from "@/components/ui/textarea"
 import { toast } from "sonner"
+import * as XLSX from "xlsx"
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog"
 import { BarcodeDisplay } from "@/components/ui/barcode-display"
-import { warehousesApi, productsApi, categoriesApi } from "@/lib/api"
+import { warehousesApi, productsApi, categoriesApi, vendorsApi } from "@/lib/api"
 import type { Warehouse } from "@/app/supply-chain/warehouse/types"
+import type { Vendor } from "@/app/supply-chain/vendors/types"
+import { getGoogleDrivePreviewUrl } from "@/lib/utils"
+import { encodeCode128B, formatLocalVariantBarcode, parseVariantBarcodeSegments } from "@/lib/barcode-utils"
 
 interface Subcategory {
     subcategoryId: number;
@@ -45,20 +50,301 @@ interface Category {
 }
 
 export default function AddProductPage() {
-    const router = useRouter()
+    const navigate = useNavigate()
+    const router = useNavigate()
     const [isLoading, setIsLoading] = React.useState(false)
     const [name, setName] = React.useState("")
     const [baseSKU, setBaseSKU] = React.useState("")
+    const [hsnCode, setHsnCode] = React.useState("")
+    const [vendorName, setVendorName] = React.useState("")
+    const [vendors, setVendors] = React.useState<Vendor[]>([])
     const [description, setDescription] = React.useState("")
     const [brand, setBrand] = React.useState("")
     const [unit, setUnit] = React.useState("PCS")
     const [selectedCategoryIds, setSelectedCategoryIds] = React.useState<number[]>([])
     const [categories, setCategories] = React.useState<Category[]>([])
-    const [taggingNo, setTaggingNo] = React.useState("")
+
+    const unitOptions: SearchableOption[] = [
+        { value: "PCS", label: "Pieces (PCS)" },
+        { value: "BOX", label: "Box" },
+        { value: "PKT", label: "Packet" },
+        { value: "SET", label: "Set" },
+    ]
+
     const [warehouses, setWarehouses] = React.useState<Warehouse[]>([])
+
+    const warehouseOptions: SearchableOption[] = React.useMemo(() => {
+        return warehouses.map((w) => {
+            const wId = String(w.id || (w as any).warehouseId)
+            const wName = w.name || (w as any).warehouseName || `Warehouse #${wId}`
+            const addr = w.address
+            const city = typeof addr === "object" && addr ? addr.city : undefined
+            return {
+                value: wId,
+                label: wName,
+                badge: city,
+                keywords: [wName, city || ""],
+            }
+        })
+    }, [warehouses])
+
+    const [taggingNo, setTaggingNo] = React.useState("")
     // Placeholder for product ID used in barcode generation
     const [tempProdId, setTempProdId] = React.useState("0000")
-    
+
+    // Excel Import States
+    const [isImportOpen, setIsImportOpen] = React.useState(false)
+    const [previewData, setPreviewData] = React.useState<any>(null)
+
+    const calculateSalesPrice = (basePrice: string | number, gst: string | number) => {
+        const bp = parseFloat(String(basePrice))
+        const gstRate = parseFloat(String(gst))
+        if (isNaN(bp) || bp < 0) return ""
+        const rate = isNaN(gstRate) || gstRate < 0 ? 0 : gstRate
+        return (bp * (1 + rate / 100)).toFixed(2)
+    }
+
+    const calculateBasePrice = (salesPrice: string | number, gst: string | number) => {
+        const sp = parseFloat(String(salesPrice))
+        const gstRate = parseFloat(String(gst))
+        if (isNaN(sp) || sp < 0) return ""
+        const rate = isNaN(gstRate) || gstRate < 0 ? 0 : gstRate
+        return (sp / (1 + rate / 100)).toFixed(2)
+    }
+
+    const downloadTemplate = () => {
+        const headers = [
+            "Product Name",
+            "Base SKU",
+            "HSN Code",
+            "Vendor Name",
+            "Brand",
+            "Unit",
+            "Description",
+            "Tagging No",
+            "Category Path",
+            "Variant Name",
+            "Size",
+            "SKU Suffix",
+            "Cost Price (INR)",
+            "Base Price (INR)",
+            "Sale Price IND (INR)",
+            "Sale Price INTL (USD)",
+            "GST %",
+            "Initial Stock",
+            "Reorder Level",
+            "Warehouse Name/ID",
+            "Rack Location",
+            "Image URL"
+        ]
+
+        const sampleRow = [
+            "Analyser-ASL (3 Lense)",
+            "ASL-3",
+            "901890",
+            "Aram Huvis Co.",
+            "Aram Huvis",
+            "PCS",
+            "Premium skin and hair analyser system",
+            "TAG-8080",
+            "Hair & Skin > Consultation Tools",
+            "Default",
+            "Standard",
+            "-DEF",
+            "59289",
+            "125000",
+            "147500",
+            "0",
+            "18",
+            "10",
+            "5",
+            "Main Hub Mumbai",
+            "Aisle 1, Rack B",
+            "https://example.com/image.jpg"
+        ]
+
+        const ws = XLSX.utils.aoa_to_sheet([headers, sampleRow])
+        const wb = XLSX.utils.book_new()
+        XLSX.utils.book_append_sheet(wb, ws, "Product & Variants")
+        XLSX.writeFile(wb, "Tejco_Product_Import_Template.xlsx")
+    }
+
+    const getWarehouseId = (inputVal: string) => {
+        if (!inputVal) return ""
+        const numericId = parseInt(inputVal)
+        if (!isNaN(numericId)) {
+            const found = warehouses.find(w => w.id === String(numericId))
+            if (found) return String(found.id)
+        }
+        const foundByName = warehouses.find(w => w.name.toLowerCase().trim() === inputVal.toLowerCase().trim())
+        if (foundByName) return String(foundByName.id)
+        return ""
+    }
+
+    const getWarehouseName = (idOrName: string) => {
+        if (!idOrName) return "-"
+        const found = warehouses.find(w => String(w.id) === idOrName || w.name.toLowerCase().trim() === idOrName.toLowerCase().trim())
+        return found ? found.name : idOrName
+    }
+
+    const resolveCategoryPath = (pathStr: string) => {
+        if (!pathStr) return []
+        const parts = pathStr.split(">").map(p => p.trim())
+        const resolvedIds: number[] = []
+        let currentOptions: (Category | Subcategory)[] = categories
+
+        for (const part of parts) {
+            const found = currentOptions.find(o =>
+                ((o as any).subcategoryName || (o as any).categoryName).toLowerCase() === part.toLowerCase()
+            )
+            if (found) {
+                resolvedIds.push((found as any).subcategoryId || (found as any).categoryId)
+                currentOptions = found.subcategories || []
+            } else {
+                break
+            }
+        }
+        return resolvedIds
+    }
+
+    const parseExcel = (file: File) => {
+        const reader = new FileReader()
+        reader.onload = (e) => {
+            try {
+                const data = e.target?.result
+                if (!data) return
+                const workbook = XLSX.read(data, { type: "binary" })
+                const sheetName = workbook.SheetNames[0]
+                const sheet = workbook.Sheets[sheetName]
+                const rows = XLSX.utils.sheet_to_json<any>(sheet)
+                if (rows.length === 0) {
+                    toast.error("The Excel sheet has no data.")
+                    return
+                }
+
+                // Extract product info from the first row
+                const firstRow = rows[0]
+                const productName = firstRow["Product Name"] || firstRow["Name"] || ""
+                const baseSKU = firstRow["Base SKU"] || firstRow["SKU"] || firstRow["HSN Code"] || ""
+                const hsnCode = firstRow["HSN Code"] || firstRow["HSN"] || ""
+                const vendorName = firstRow["Vendor Name"] || firstRow["Vendor"] || ""
+                const brand = firstRow["Brand"] || ""
+                const unit = firstRow["Unit"] || "PCS"
+                const description = firstRow["Description"] || ""
+                const taggingNo = firstRow["Tagging No"] || firstRow["Product Tagging No"] || ""
+                const categoryPath = firstRow["Category Path"] || firstRow["Category"] || ""
+
+                // Extract variants from all rows
+                const parsedVariants = rows.map((row: any, index: number) => {
+                    const gstPercentage = String(row["GST %"] || row["GST Percentage"] || row["GST"] || "18")
+                    let basePrice = String(row["Base Price (INR)"] || row["Base Price"] || "")
+                    let salesPrice = String(row["Sale Price IND (INR)"] || row["Sale Price IND"] || row["Sale Price"] || row["Selling Price"] || "")
+
+                    if (basePrice && !salesPrice) {
+                        salesPrice = calculateSalesPrice(basePrice, gstPercentage)
+                    } else if (salesPrice && !basePrice) {
+                        basePrice = calculateBasePrice(salesPrice, gstPercentage)
+                    }
+
+                    return {
+                        id: index + 1,
+                        name: row["Variant Name"] || row["Variant"] || `Variant ${index + 1}`,
+                        size: row["Size"] || row["Variant Size"] || "",
+                        sku_suffix: row["SKU Suffix"] || row["Suffix"] || "",
+                        hsnCode: row["HSN Code"] || row["HSN"] || hsnCode || "",
+                        basePrice: basePrice,
+                        salesPrice: salesPrice,
+                        exportSalesPrice: String(row["Sale Price INTL (USD)"] || row["Sale Price INTL"] || row["Export Price"] || row["USD Amount"] || ""),
+                        gstPercentage: gstPercentage,
+                        costPrice: String(row["Cost Price (INR)"] || row["Cost Price"] || ""),
+                        stock: String(row["Initial Stock"] || row["Stock Quantity"] || row["Stock"] || row["Quantity"] || row["Qty"] || ""),
+                        reservedQuantity: String(row["Reserved Quantity"] || row["Reserved Stock"] || "0"),
+                        reorderLevel: String(row["Reorder Level"] || row["Reorder"] || "5"),
+                        warehouseId: String(row["Warehouse Name/ID"] || row["Warehouse"] || row["Warehouse ID"] || ""),
+                        rackLocation: row["Rack Location"] || row["Rack"] || row["Location"] || "",
+                        image: row["Image URL"] || row["Image"] || null
+                    }
+                })
+
+                setPreviewData({
+                    product: { productName, baseSKU, hsnCode, vendorName, brand, unit, description, taggingNo, categoryPath },
+                    variants: parsedVariants
+                })
+                toast.success("Excel file parsed successfully. Preview loaded.")
+            } catch (err) {
+                console.error("Error parsing Excel:", err)
+                toast.error("Failed to parse Excel file. Please verify sheet formatting.")
+            }
+        }
+        reader.readAsBinaryString(file)
+    }
+
+    const handleImportApply = () => {
+        if (!previewData) return
+        setName(previewData.product.productName)
+        setBaseSKU(previewData.product.baseSKU)
+        setHsnCode(previewData.product.hsnCode || "")
+        setVendorName(previewData.product.vendorName || "")
+        setBrand(previewData.product.brand)
+        setUnit(previewData.product.unit)
+        setDescription(previewData.product.description)
+        setTaggingNo(previewData.product.taggingNo)
+
+        let activePath = selectedCategoryIds
+        if (previewData.product.categoryPath) {
+            const resolvedPath = resolveCategoryPath(previewData.product.categoryPath)
+            if (resolvedPath.length > 0) {
+                activePath = resolvedPath
+                setSelectedCategoryIds(resolvedPath)
+            }
+        }
+
+        const mappedVariants = previewData.variants.map((v: any, index: number) => {
+            const wId = getWarehouseId(v.warehouseId)
+            return {
+                id: v.id,
+                name: v.name,
+                size: v.size || "",
+                sku_suffix: v.sku_suffix,
+                hsnCode: v.hsnCode || previewData.product.hsnCode || previewData.product.baseSKU || "",
+                basePrice: v.basePrice || "",
+                salesPrice: v.salesPrice,
+                exportSalesPrice: v.exportSalesPrice,
+                gstPercentage: v.gstPercentage,
+                costPrice: v.costPrice,
+                stock: v.stock,
+                reservedQuantity: v.reservedQuantity || "0",
+                reorderLevel: v.reorderLevel || "5",
+                status: true,
+                barcode: formatLocalVariantBarcode(activePath, tempProdId, index),
+                warehouseId: wId,
+                rackLocation: v.rackLocation,
+                image: v.image
+            }
+        })
+
+        setVariants(mappedVariants)
+        setIsImportOpen(false)
+        setPreviewData(null)
+        toast.success("Imported details successfully loaded into the form.")
+
+        // Sync batch barcodes with backend API
+        productsApi.generateVariantBarcode({
+            categoryPath: activePath,
+            tempProdId,
+            index: 0,
+            variantCount: mappedVariants.length
+        }).then(res => {
+            const barcodes = res?.data?.barcodes
+            if (Array.isArray(barcodes) && barcodes.length > 0) {
+                setVariants(prev => prev.map((v, i) => ({
+                    ...v,
+                    barcode: barcodes[i] || v.barcode
+                })))
+            }
+        }).catch(() => {})
+    }
+
     // Generate a random product ID only on the client to avoid hydration mismatch
     React.useEffect(() => {
         setTempProdId(Math.floor(1000 + Math.random() * 9000).toString())
@@ -68,11 +354,13 @@ export default function AddProductPage() {
     React.useEffect(() => {
         const fetchData = async () => {
             try {
-                const [wData, cData] = await Promise.all([
-                    warehousesApi.getAll(),
-                    categoriesApi.getAll()
+                const [wData, cData, vData] = await Promise.all([
+                    warehousesApi.getAll().catch(() => []),
+                    categoriesApi.getAll().catch(() => []),
+                    vendorsApi.getAll().catch(() => [])
                 ])
                 setWarehouses(wData)
+                setVendors(vData)
                 // The API might return { data: [...] } or just [...]
                 const categoryList = (cData as any).data || cData
                 setCategories(Array.isArray(categoryList) ? categoryList : [])
@@ -85,14 +373,21 @@ export default function AddProductPage() {
 
     // Dynamic state for variants
     const [variants, setVariants] = React.useState([
-        { 
-            id: 1, 
-            name: "Default", 
-            sku_suffix: "-DEF", 
-            salesPrice: "", 
-            gstPercentage: "18", 
+        {
+            id: 1,
+            name: "Default",
+            size: "",
+            sku_suffix: "-DEF",
+            hsnCode: "",
             costPrice: "",
-            stock: "", 
+            basePrice: "",
+            salesPrice: "",
+            exportSalesPrice: "",
+            gstPercentage: "18",
+            stock: "",
+            reservedQuantity: "0",
+            reorderLevel: "5",
+            status: true,
             barcode: "",
             warehouseId: "",
             rackLocation: "",
@@ -100,50 +395,90 @@ export default function AddProductPage() {
         }
     ])
 
-    const generateVariantBarcode = React.useCallback((index: number, path: number[]) => {
-        const c = path[0] ? String(path[0]) : "0"
-        const s = path[path.length - 1] ? String(path[path.length - 1]).padStart(3, '0') : "000"
-        const p = tempProdId
-        const v = (index + 1).toString().padStart(2, '0')
-        return `${c}${s}${p}${v}`
-    }, [tempProdId])
-
-    const calculateBasePrice = (salesPrice: string, gst: string) => {
-        const price = parseFloat(salesPrice)
-        const gstRate = parseFloat(gst)
-        if (isNaN(price) || isNaN(gstRate)) return "0.00"
-        return (price - (price * gstRate / 100)).toFixed(2)
-    }
+    const generateVariantBarcode = React.useCallback((index: number, path: number[] = selectedCategoryIds) => {
+        return formatLocalVariantBarcode(path, tempProdId, index)
+    }, [selectedCategoryIds, tempProdId])
 
     // Effect to auto-generate barcodes when category selection path changes
     React.useEffect(() => {
+        if (variants.length === 0) return
+
+        let isCancelled = false
+
+        // 1. Optimistic update with local matching format
         setVariants(prev => prev.map((v, i) => ({
             ...v,
-            barcode: generateVariantBarcode(i, selectedCategoryIds)
+            barcode: formatLocalVariantBarcode(selectedCategoryIds, tempProdId, i)
         })))
-    }, [selectedCategoryIds, generateVariantBarcode])
+
+        // 2. Authoritative backend generation
+        productsApi.generateVariantBarcode({
+            categoryPath: selectedCategoryIds,
+            tempProdId,
+            index: 0,
+            variantCount: variants.length
+        }).then(res => {
+            if (isCancelled) return
+            const barcodes = res?.data?.barcodes
+            if (Array.isArray(barcodes) && barcodes.length > 0) {
+                setVariants(prev => prev.map((v, i) => ({
+                    ...v,
+                    barcode: barcodes[i] || v.barcode
+                })))
+            }
+        }).catch(err => {
+            console.warn("Backend variant barcode generation API unreachable, kept client fallback:", err)
+        })
+
+        return () => {
+            isCancelled = true
+        }
+    }, [selectedCategoryIds, tempProdId, variants.length])
 
     const addVariant = () => {
         const newIndex = variants.length
-        setVariants([...variants, { 
-            id: Date.now(), 
-            name: "", 
-            sku_suffix: "", 
-            salesPrice: "", 
-            gstPercentage: "18", 
+        const fallbackBarcode = formatLocalVariantBarcode(selectedCategoryIds, tempProdId, newIndex)
+        const newVarId = Date.now()
+
+        setVariants(prev => [...prev, {
+            id: newVarId,
+            name: "",
+            size: "",
+            sku_suffix: "",
+            hsnCode: "",
             costPrice: "",
-            stock: "", 
-            barcode: generateVariantBarcode(newIndex, selectedCategoryIds),
+            basePrice: "",
+            salesPrice: "",
+            exportSalesPrice: "",
+            gstPercentage: "18",
+            stock: "",
+            reservedQuantity: "0",
+            reorderLevel: "5",
+            status: true,
+            barcode: fallbackBarcode,
             warehouseId: "",
             rackLocation: "",
             image: null as string | null
         }])
+
+        // Request authoritative barcode from API for the new variant
+        productsApi.generateVariantBarcode({
+            categoryPath: selectedCategoryIds,
+            tempProdId,
+            index: newIndex,
+            variantCount: 1
+        }).then(res => {
+            const confirmedBarcode = res?.data?.barcode || res?.data?.barcodes?.[0]
+            if (confirmedBarcode) {
+                setVariants(prev => prev.map(v => v.id === newVarId ? { ...v, barcode: confirmedBarcode } : v))
+            }
+        }).catch(() => {})
     }
 
     const handleImageChange = (id: number, file: File) => {
         const reader = new FileReader()
         reader.onloadend = () => {
-            setVariants(prev => prev.map(v => 
+            setVariants(prev => prev.map(v =>
                 v.id === id ? { ...v, image: reader.result as string } : v
             ))
         }
@@ -153,7 +488,7 @@ export default function AddProductPage() {
     }
 
     const removeImage = (id: number) => {
-        setVariants(prev => prev.map(v => 
+        setVariants(prev => prev.map(v =>
             v.id === id ? { ...v, image: null } : v
         ))
     }
@@ -165,9 +500,26 @@ export default function AddProductPage() {
     }
 
     const handleVariantChange = (id: number, field: string, value: string) => {
-        setVariants(variants.map(v =>
-            v.id === id ? { ...v, [field]: value } : v
-        ))
+        const finalValue = field === "image" ? (getGoogleDrivePreviewUrl(value) || "") : value
+        setVariants(variants.map(v => {
+            if (v.id !== id) return v
+
+            const updated = { ...v, [field]: finalValue }
+
+            if (field === "basePrice") {
+                updated.salesPrice = calculateSalesPrice(finalValue, updated.gstPercentage)
+            } else if (field === "gstPercentage") {
+                if (updated.basePrice) {
+                    updated.salesPrice = calculateSalesPrice(updated.basePrice, finalValue)
+                } else if (updated.salesPrice) {
+                    updated.basePrice = calculateBasePrice(updated.salesPrice, finalValue)
+                }
+            } else if (field === "salesPrice") {
+                updated.basePrice = calculateBasePrice(finalValue, updated.gstPercentage)
+            }
+
+            return updated
+        }))
     }
 
     async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -178,8 +530,12 @@ export default function AddProductPage() {
             productId: 0,
             productName: name,
             baseSKU: baseSKU,
+            vendorName: vendorName,
+            VendorName: vendorName,
+            hsnCode: hsnCode,
+            HSNCode: hsnCode,
             productTaggingNo: taggingNo,
-            barcodeNumber: tempProdId, // Using the generated base ID
+            barcodeNumber: tempProdId,
             categoryId: selectedCategoryIds[0] || 0,
             subcategoryId: selectedCategoryIds[1] || 0,
             subcategoryL2Id: selectedCategoryIds[2] || 0,
@@ -195,24 +551,32 @@ export default function AddProductPage() {
                 productId: 0,
                 variantName: v.name,
                 skuSuffix: v.sku_suffix,
+                size: v.size || "",
+                Size: v.size || "",
+                hsnCode: v.hsnCode || hsnCode || baseSKU || "",
+                HSNCode: v.hsnCode || hsnCode || baseSKU || "",
                 purchasePrice: parseFloat(v.costPrice) || 0,
+                basePrice: parseFloat(v.basePrice) || 0,
+                BasePrice: parseFloat(v.basePrice) || 0,
                 sellingPrice: parseFloat(v.salesPrice) || 0,
                 initialQuantity: parseInt(v.stock) || 0,
                 currentQuantity: parseInt(v.stock) || 0,
-                reorderLevel: 5, // Default
+                reservedQuantity: parseInt(v.reservedQuantity as string) || 0,
+                reorderLevel: parseInt(v.reorderLevel as string) || 0,
                 status: true,
                 gstPercentage: parseInt(v.gstPercentage) || 0,
                 warehouseId: parseInt(v.warehouseId) || 0,
-                rackLocation: v.rackLocation,
-                barcodeNumber: v.barcode,
-                variantImage: v.image || ""
+                rackLocation: v.rackLocation || "",
+                barcodeNumber: v.barcode || "",
+                variantImage: v.image || "",
+                usdAmount: parseFloat(v.exportSalesPrice) || 0
             }))
         }
 
         try {
             await productsApi.create(payload)
             toast.success("Product created successfully with " + variants.length + " variants")
-            router.push("/inventory/products")
+            navigate("/inventory/products")
         } catch (error) {
             console.error("Error creating product:", error)
             toast.error("Failed to create product. Please try again.")
@@ -225,7 +589,7 @@ export default function AddProductPage() {
         <div className="flex flex-col gap-6 max-w-5xl mx-auto pb-10">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                    <Button variant="outline" size="icon" onClick={() => router.back()}>
+                    <Button variant="outline" size="icon" onClick={() => navigate(-1)}>
                         <ArrowLeft className="h-4 w-4" />
                     </Button>
                     <div>
@@ -233,6 +597,9 @@ export default function AddProductPage() {
                         <p className="text-muted-foreground">Create a new item in your catalog with variants and stock levels.</p>
                     </div>
                 </div>
+                <Button type="button" variant="outline" onClick={() => setIsImportOpen(true)} className="gap-2">
+                    <UploadCloud className="h-4 w-4" /> Import from Excel
+                </Button>
             </div>
 
             <form onSubmit={onSubmit}>
@@ -261,22 +628,47 @@ export default function AddProductPage() {
                                         />
                                     </div>
                                     <div className="grid gap-2">
-                                        <Label htmlFor="sku">Base SKU</Label>
-                                        <Input 
-                                            id="sku" 
-                                            placeholder="e.g., SB-010" 
-                                            required 
+                                        <Input
+                                            id="sku"
+                                            placeholder="e.g., SB-010"
+                                            required
                                             value={baseSKU}
                                             onChange={(e) => setBaseSKU(e.target.value)}
                                         />
                                     </div>
                                 </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="hsnCode">HSN Code</Label>
+                                        <Input
+                                            id="hsnCode"
+                                            placeholder="e.g., 901890"
+                                            value={hsnCode}
+                                            onChange={(e) => setHsnCode(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="grid gap-2">
+                                        <Label htmlFor="vendorName">Vendor Name</Label>
+                                        <Input
+                                            id="vendorName"
+                                            list="vendor-suggestions"
+                                            placeholder="Select or enter vendor name"
+                                            value={vendorName}
+                                            onChange={(e) => setVendorName(e.target.value)}
+                                        />
+                                        <datalist id="vendor-suggestions">
+                                            {vendors.map((v, i) => (
+                                                <option key={(v as any).id || (v as any).vendorId || i} value={(v as any).vendorName || (v as any).name} />
+                                            ))}
+                                        </datalist>
+                                    </div>
+                                </div>
                                 <div className="grid gap-2">
                                     <Label htmlFor="description">Description</Label>
-                                    <Textarea 
-                                        id="description" 
-                                        placeholder="Technical specifications and usage details..." 
-                                        rows={3} 
+                                    <Textarea
+                                        id="description"
+                                        placeholder="Technical specifications and usage details..."
+                                        rows={3}
                                         value={description}
                                         onChange={(e) => setDescription(e.target.value)}
                                     />
@@ -299,48 +691,43 @@ export default function AddProductPage() {
                                     {(() => {
                                         const renderedSelects = []
                                         let currentOptions: (Category | Subcategory)[] = categories
-                                        
+
                                         // Always show root level, then show subsequent levels if a parent is selected and has children
                                         for (let i = 0; i <= selectedCategoryIds.length; i++) {
                                             if (currentOptions.length === 0 && i > 0) break;
-                                            
+
                                             const levelIndex = i
                                             const selectedId = selectedCategoryIds[i]
                                             const currentVal = selectedId ? String(selectedId) : ""
                                             const label = levelIndex === 0 ? "Category" : `Subcategory Level ${levelIndex}`
-                                            
+
                                             const selectedItem = selectedId ? currentOptions.find(o => ((o as any).subcategoryId || (o as any).categoryId) === selectedId) : null
                                             const selectedName = selectedItem ? ((selectedItem as any).subcategoryName || (selectedItem as any).categoryName) : ""
+
+                                            const optItems: SearchableOption[] = currentOptions.map((opt) => {
+                                                const id = (opt as any).subcategoryId || (opt as any).categoryId
+                                                const name = (opt as any).subcategoryName || (opt as any).categoryName
+                                                return {
+                                                    value: String(id),
+                                                    label: name,
+                                                }
+                                            })
 
                                             renderedSelects.push(
                                                 <div key={levelIndex} className="grid gap-2">
                                                     <Label>{label}</Label>
-                                                    <Select 
-                                                        required={levelIndex === 0} 
-                                                        value={currentVal} 
-                                                        onValueChange={(val) => {
+                                                    <SearchableDropdown
+                                                        value={currentVal}
+                                                        onChange={(val) => {
                                                             const newPath = selectedCategoryIds.slice(0, levelIndex)
                                                             if (val) newPath.push(parseInt(val))
                                                             setSelectedCategoryIds(newPath)
                                                         }}
-                                                    >
-                                                        <SelectTrigger className="w-full">
-                                                            <SelectValue placeholder={`Select ${label.toLowerCase()}`}>
-                                                                {selectedName}
-                                                            </SelectValue>
-                                                        </SelectTrigger>
-                                                        <SelectContent>
-                                                            {currentOptions.map((opt) => {
-                                                                const id = (opt as any).subcategoryId || (opt as any).categoryId
-                                                                const name = (opt as any).subcategoryName || (opt as any).categoryName
-                                                                return (
-                                                                    <SelectItem key={id} value={String(id)}>
-                                                                        {name}
-                                                                    </SelectItem>
-                                                                )
-                                                            })}
-                                                        </SelectContent>
-                                                    </Select>
+                                                        options={optItems}
+                                                        placeholder={`Select ${label.toLowerCase()}`}
+                                                        searchPlaceholder={`Search ${label.toLowerCase()}...`}
+                                                        allowClear={levelIndex > 0}
+                                                    />
                                                 </div>
                                             )
 
@@ -366,17 +753,13 @@ export default function AddProductPage() {
                                     </div>
                                     <div className="grid gap-2">
                                         <Label htmlFor="unit">Unit</Label>
-                                        <Select value={unit} onValueChange={(val) => setUnit(val || "PCS")}>
-                                            <SelectTrigger id="unit">
-                                                <SelectValue />
-                                            </SelectTrigger>
-                                            <SelectContent>
-                                                <SelectItem value="PCS">Pieces (PCS)</SelectItem>
-                                                <SelectItem value="BOX">Box</SelectItem>
-                                                <SelectItem value="PKT">Packet</SelectItem>
-                                                <SelectItem value="SET">Set</SelectItem>
-                                            </SelectContent>
-                                        </Select>
+                                        <SearchableDropdown
+                                            value={unit}
+                                            onChange={(val) => setUnit(val || "PCS")}
+                                            options={unitOptions}
+                                            placeholder="Select unit"
+                                            popoverWidth={200}
+                                        />
                                     </div>
                                 </div>
                                 <div className="grid gap-2 pt-2 border-t">
@@ -410,13 +793,13 @@ export default function AddProductPage() {
                         </CardHeader>
                         <CardContent className="grid gap-6">
                             {variants.map((v, index) => (
-                                <div key={v.id} className="relative grid gap-4 p-5 border-2 rounded-xl bg-muted/20 hover:bg-muted/40 transition-colors">
+                                <div key={v.id} className="relative grid gap-4 pt-8 p-5 border-2 rounded-xl bg-muted/20 hover:bg-muted/40 transition-colors">
                                     {variants.length > 1 && (
                                         <Button
                                             type="button"
                                             variant="ghost"
                                             size="icon"
-                                            className="absolute top-2 right-2 h-8 w-8 text-destructive hover:bg-destructive/10"
+                                            className="absolute top-0 right-2 h-8 w-8 text-destructive hover:bg-destructive/10"
                                             onClick={() => removeVariant(v.id)}
                                         >
                                             <Trash2 className="h-4 w-4" />
@@ -424,7 +807,7 @@ export default function AddProductPage() {
                                     )}
                                     <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
                                         {/* Column 1: Variant Info */}
-                                        <div className="md:col-span-4 grid gap-4">
+                                        <div className="md:col-span-3 grid gap-4">
                                             <div className="grid gap-2">
                                                 <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Variant Name</Label>
                                                 <Input
@@ -434,25 +817,44 @@ export default function AddProductPage() {
                                                     required
                                                 />
                                             </div>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div className="grid gap-2">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Size</Label>
+                                                    <Input
+                                                        placeholder="e.g., XL / 100ml"
+                                                        value={v.size || ""}
+                                                        onChange={(e) => handleVariantChange(v.id, "size", e.target.value)}
+                                                    />
+                                                </div>
+                                                <div className="grid gap-2">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">LOT Number  j0987is 6</Label>
+                                                    <Input
+                                                        placeholder="-LG"
+                                                        value={v.sku_suffix}
+                                                        onChange={(e) => handleVariantChange(v.id, "sku_suffix", e.target.value)}
+                                                    />
+                                                </div>
+                                            </div>
                                             <div className="grid gap-2">
-                                                <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">SKU Suffix</Label>
+                                                <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">HSN Code</Label>
                                                 <Input
-                                                    placeholder="-LG"
-                                                    value={v.sku_suffix}
-                                                    onChange={(e) => handleVariantChange(v.id, "sku_suffix", e.target.value)}
+                                                    placeholder={hsnCode || baseSKU || "HSN Code"}
+                                                    value={v.hsnCode}
+                                                    onChange={(e) => handleVariantChange(v.id, "hsnCode", e.target.value)}
                                                 />
                                             </div>
                                         </div>
 
                                         {/* Column 2: Pricing & Breakdown */}
-                                        <div className="md:col-span-3 grid gap-4 border-l pl-6">
-                                            <div className="grid grid-cols-1 gap-4">
+                                        <div className="md:col-span-4 grid gap-4 border-l pl-6">
+                                            <div className="grid grid-cols-2 gap-4">
                                                 <div className="grid gap-2">
                                                     <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Cost Price (₹)</Label>
                                                     <div className="relative">
                                                         <IndianRupee className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                                                         <Input
                                                             type="number"
+                                                            step="any"
                                                             className="pl-8"
                                                             placeholder="0.00"
                                                             value={v.costPrice}
@@ -462,15 +864,16 @@ export default function AddProductPage() {
                                                     </div>
                                                 </div>
                                                 <div className="grid gap-2">
-                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Sales Price (₹)</Label>
+                                                    <Label className="text-xs font-bold uppercase tracking-wide text-muted-foreground">Base Price (₹)</Label>
                                                     <div className="relative">
                                                         <IndianRupee className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                                                         <Input
                                                             type="number"
-                                                            className="pl-8"
+                                                            step="any"
+                                                            className="pl-8 font-medium"
                                                             placeholder="0.00"
-                                                            value={v.salesPrice}
-                                                            onChange={(e) => handleVariantChange(v.id, "salesPrice", e.target.value)}
+                                                            value={v.basePrice ?? ""}
+                                                            onChange={(e) => handleVariantChange(v.id, "basePrice", e.target.value)}
                                                             required
                                                         />
                                                     </div>
@@ -481,6 +884,7 @@ export default function AddProductPage() {
                                                     <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">GST %</Label>
                                                     <Input
                                                         type="number"
+                                                        step="any"
                                                         placeholder="18"
                                                         value={v.gstPercentage}
                                                         onChange={(e) => handleVariantChange(v.id, "gstPercentage", e.target.value)}
@@ -488,9 +892,35 @@ export default function AddProductPage() {
                                                     />
                                                 </div>
                                                 <div className="grid gap-2">
-                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Base Price</Label>
-                                                    <div className="h-10 flex items-center px-3 rounded-md bg-emerald-50 text-emerald-700 font-semibold border border-emerald-100">
-                                                        ₹{calculateBasePrice(v.salesPrice, v.gstPercentage)}
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground flex items-center justify-between">
+                                                        <span>Sale Price (₹)</span>
+                                                    </Label>
+                                                    <div className="relative">
+                                                        <IndianRupee className="absolute left-2.5 top-2.5 h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                                                        <Input
+                                                            type="number"
+                                                            step="any"
+                                                            className="pl-8 bg-emerald-50/50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800 font-semibold text-emerald-900 dark:text-emerald-200 cursor-default"
+                                                            placeholder="0.00"
+                                                            value={v.salesPrice}
+                                                            readOnly
+                                                            title="Auto-calculated: Base Price + GST"
+                                                        />
+                                                    </div>
+                                                </div>
+                                                <div className="grid gap-2 col-span-2">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Sale Price (INTL) ($)</Label>
+                                                    <div className="relative">
+                                                        <span className="absolute left-3 top-2.5 text-sm font-semibold text-muted-foreground">$</span>
+                                                        <Input
+                                                            type="number"
+                                                            step="any"
+                                                            className="pl-8"
+                                                            placeholder="0.00"
+                                                            value={v.exportSalesPrice}
+                                                            onChange={(e) => handleVariantChange(v.id, "exportSalesPrice", e.target.value)}
+                                                            required
+                                                        />
                                                     </div>
                                                 </div>
                                             </div>
@@ -498,37 +928,47 @@ export default function AddProductPage() {
 
                                         {/* Column 3: Inventory & Warehouse */}
                                         <div className="md:col-span-3 grid gap-4 border-l pl-6">
-                                            <div className="grid gap-2">
-                                                <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Initial Stock</Label>
-                                                <Input
-                                                    type="number"
-                                                    placeholder="0"
-                                                    value={v.stock}
-                                                    onChange={(e) => handleVariantChange(v.id, "stock", e.target.value)}
-                                                    required
-                                                />
-                                            </div>
-                                            <div className="grid grid-cols-2 gap-4">
-                                                <div className="grid gap-2">
-                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Warehouse</Label>
-                                                    <Select 
-                                                        value={v.warehouseId} 
-                                                        onValueChange={(val) => handleVariantChange(v.id, "warehouseId", val || "")}
-                                                    >
-                                                        <SelectTrigger className="h-9">
-                                                            <SelectValue placeholder="Select" />
-                                                        </SelectTrigger>
-                                                        <SelectContent>
-                                                            {warehouses.map(w => (
-                                                                <SelectItem key={w.id} value={w.id}>{w.name}</SelectItem>
-                                                            ))}
-                                                        </SelectContent>
-                                                    </Select>
-                                                </div>
-                                                <div className="grid gap-2">
-                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Rack/Place</Label>
+                                            <div className="grid grid-cols-2 gap-3 min-w-0">
+                                                <div className="grid gap-2 min-w-0">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground truncate" title="Initial Stock">Initial Stock</Label>
                                                     <Input
-                                                        className="h-9"
+                                                        type="number"
+                                                        placeholder="0"
+                                                        value={v.stock}
+                                                        className="h-9 w-full min-w-0"
+                                                        onChange={(e) => handleVariantChange(v.id, "stock", e.target.value)}
+                                                        required
+                                                    />
+                                                </div>
+                                                <div className="grid gap-2 min-w-0">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground truncate" title="Reorder Level">Reorder Level</Label>
+                                                    <Input
+                                                        type="number"
+                                                        placeholder="5"
+                                                        value={v.reorderLevel}
+                                                        className="h-9 w-full min-w-0"
+                                                        onChange={(e) => handleVariantChange(v.id, "reorderLevel", e.target.value)}
+                                                    />
+                                                </div>
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-3 min-w-0">
+                                                <div className="grid gap-2 min-w-0">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground truncate" title="Warehouse">Warehouse</Label>
+                                                    <SearchableDropdown
+                                                        value={v.warehouseId ? String(v.warehouseId) : ""}
+                                                        onChange={(val) => handleVariantChange(v.id, "warehouseId", val || "")}
+                                                        options={warehouseOptions}
+                                                        placeholder="Select warehouse..."
+                                                        searchPlaceholder="Search warehouse..."
+                                                        size="sm"
+                                                        allowClear
+                                                        popoverWidth={280}
+                                                    />
+                                                </div>
+                                                <div className="grid gap-2 min-w-0">
+                                                    <Label className="text-xs font-bold uppercase tracking-wider text-muted-foreground truncate" title="Rack/Place">Rack/Place</Label>
+                                                    <Input
+                                                        className="h-9 w-full min-w-0"
                                                         placeholder="A-1"
                                                         value={v.rackLocation}
                                                         onChange={(e) => handleVariantChange(v.id, "rackLocation", e.target.value)}
@@ -543,12 +983,12 @@ export default function AddProductPage() {
                                             <div className="relative aspect-square w-full rounded-lg border-2 border-dashed border-muted-foreground/20 bg-white flex items-center justify-center overflow-hidden group">
                                                 {v.image ? (
                                                     <>
-                                                        <img src={v.image} alt="Variant Preview" className="w-full h-full object-cover" />
-                                                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
-                                                            <Button 
-                                                                type="button" 
-                                                                variant="destructive" 
-                                                                size="icon" 
+                                                        <img src={v.image} alt="Variant Preview" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                                        <div className="absolute inset-0 bg-black/40 z-20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
+                                                            <Button
+                                                                type="button"
+                                                                variant="destructive"
+                                                                size="icon"
                                                                 className="h-8 w-8"
                                                                 onClick={() => removeImage(v.id)}
                                                             >
@@ -558,29 +998,11 @@ export default function AddProductPage() {
                                                     </>
                                                 ) : (
                                                     <div className="flex flex-col gap-2 w-full p-2">
-                                                        <Label className="flex flex-col items-center gap-1.5 cursor-pointer hover:text-primary transition-colors py-3 border-2 border-dashed border-muted-foreground/10 rounded-lg bg-muted/5">
-                                                            <UploadCloud className="h-5 w-5 text-muted-foreground" />
-                                                            <span className="text-[9px] font-bold uppercase tracking-tight">Upload File</span>
-                                                            <input 
-                                                                type="file" 
-                                                                className="hidden" 
-                                                                accept="image/*"
-                                                                onChange={(e) => {
-                                                                    const file = e.target.files?.[0]
-                                                                    if (file) handleImageChange(v.id, file)
-                                                                }}
-                                                            />
-                                                        </Label>
-                                                        <div className="flex items-center gap-2">
-                                                            <div className="h-px flex-1 bg-muted-foreground/10" />
-                                                            <span className="text-[8px] font-bold text-muted-foreground/60">OR</span>
-                                                            <div className="h-px flex-1 bg-muted-foreground/10" />
-                                                        </div>
                                                         <div className="relative">
                                                             <ImageIcon className="absolute left-2 top-2 h-3 w-3 text-muted-foreground/50" />
-                                                            <Input 
-                                                                className="h-7 pl-6 text-[10px] bg-white/50" 
-                                                                placeholder="Paste URL" 
+                                                            <Input
+                                                                className="h-7 pl-6 text-[10px] bg-white/50"
+                                                                placeholder="Paste URL"
                                                                 onKeyDown={(e) => {
                                                                     if (e.key === 'Enter') {
                                                                         e.preventDefault()
@@ -599,19 +1021,45 @@ export default function AddProductPage() {
                                             </div>
 
                                             {/* Barcode Display */}
-                                            <div className="flex flex-col items-center justify-center p-2 rounded-lg bg-white border border-dashed gap-1">
-                                                <div className="w-full h-10">
-                                                    <svg viewBox="0 0 100 40" className="w-full h-full" preserveAspectRatio="none">
-                                                        {/* Simple dummy barcode effect */}
-                                                        {Array.from({length: 20}).map((_, i) => (
-                                                            <rect key={i} x={i * 5} y="0" width={((i * 7) % 3) + 1.5} height="40" fill="black" />
-                                                        ))}
-                                                    </svg>
-                                                </div>
-                                                <p className="text-[9px] font-mono font-bold tracking-tighter truncate w-full text-center">
-                                                    {v.barcode}
-                                                </p>
-                                            </div>
+                                            {(() => {
+                                                const encoded = encodeCode128B(v.barcode || "0000000000")
+                                                const segments = parseVariantBarcodeSegments(v.barcode || "")
+                                                return (
+                                                    <div className="flex flex-col items-center justify-center p-2 rounded-lg bg-white border border-slate-200 shadow-sm gap-1">
+                                                        <div className="w-full h-9 flex items-center justify-center overflow-hidden">
+                                                            <svg
+                                                                viewBox={`0 0 ${encoded.totalWidth} 40`}
+                                                                className="w-full h-full max-h-9"
+                                                                preserveAspectRatio="none"
+                                                            >
+                                                                {encoded.bars.map((bar, bIdx) => (
+                                                                    <rect
+                                                                        key={bIdx}
+                                                                        x={bar.x}
+                                                                        y="0"
+                                                                        width={bar.width}
+                                                                        height="40"
+                                                                        fill="#0f172a"
+                                                                    />
+                                                                ))}
+                                                            </svg>
+                                                        </div>
+                                                        <div className="flex items-center justify-between w-full px-0.5 gap-1">
+                                                            <span className="text-[10px] font-mono font-bold tracking-wider text-slate-800 truncate">
+                                                                {v.barcode || "—"}
+                                                            </span>
+                                                            {segments.rootCategoryId && (
+                                                                <span
+                                                                    className="text-[9px] font-mono text-muted-foreground bg-slate-100 px-1 py-0.5 rounded border border-slate-200 shrink-0"
+                                                                    title={`Root: ${segments.rootCategoryId} | Subcat: ${segments.subcategoryId} | Prod: ${segments.productId} | Var: ${segments.variantIndex}`}
+                                                                >
+                                                                    {segments.rootCategoryId}·{segments.subcategoryId}·{segments.productId}·{segments.variantIndex}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )
+                                            })()}
                                         </div>
                                     </div>
                                 </div>
@@ -620,7 +1068,7 @@ export default function AddProductPage() {
                     </Card>
 
                     <div className="flex items-center justify-end gap-4">
-                        <Button variant="outline" type="button" onClick={() => router.back()}>
+                        <Button variant="outline" type="button" onClick={() => navigate(-1)}>
                             <X className="mr-2 h-4 w-4" />
                             Cancel
                         </Button>
@@ -631,6 +1079,126 @@ export default function AddProductPage() {
                     </div>
                 </div>
             </form>
+
+            <Dialog open={isImportOpen} onOpenChange={setIsImportOpen}>
+                <DialogContent className="max-w-4xl max-h-[85vh] flex flex-col p-6">
+                    <DialogHeader>
+                        <DialogTitle className="text-xl font-bold flex items-center gap-2">
+                            <UploadCloud className="h-5 w-5 text-primary" />
+                            Import Product & Variants via Excel
+                        </DialogTitle>
+                        <DialogDescription>
+                            Upload an Excel sheet to populate the form fields and variants. You can download the template below.
+                        </DialogDescription>
+                    </DialogHeader>
+
+                    <div className="flex flex-col gap-4 overflow-y-auto pr-1 py-2 flex-1">
+                        <div className="flex items-center justify-between p-4 bg-muted/30 border rounded-xl">
+                            <div className="grid gap-1">
+                                <p className="text-sm font-semibold">Step 1: Download Template</p>
+                                <p className="text-xs text-muted-foreground">Use our standardized template to format your product data correctly.</p>
+                            </div>
+                            <Button type="button" variant="outline" size="sm" onClick={downloadTemplate}>
+                                Download Excel Template
+                            </Button>
+                        </div>
+
+                        <div className="grid gap-2">
+                            <p className="text-sm font-semibold">Step 2: Upload Excel File</p>
+                            <label className="border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center gap-2 hover:bg-muted/10 transition-colors cursor-pointer border-muted-foreground/20">
+                                <UploadCloud className="h-8 w-8 text-muted-foreground/60" />
+                                <span className="text-sm font-medium">Click to upload or drag & drop</span>
+                                <span className="text-xs text-muted-foreground">Supports .xlsx and .xls formats</span>
+                                <input
+                                    type="file"
+                                    className="hidden"
+                                    accept=".xlsx, .xls"
+                                    onChange={(e) => {
+                                        const file = e.target.files?.[0]
+                                        if (file) parseExcel(file)
+                                    }}
+                                />
+                            </label>
+                        </div>
+
+                        {previewData && (
+                            <div className="border rounded-xl p-4 bg-slate-50/50 space-y-4">
+                                <div className="flex items-center justify-between border-b pb-2">
+                                    <h3 className="font-bold text-sm text-slate-800">Preview Data</h3>
+                                    <span className="text-xs font-semibold text-primary">{previewData.variants.length} Variants Found</span>
+                                </div>
+
+                                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
+                                    <div>
+                                        <p className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">Product Name</p>
+                                        <p className="font-medium text-slate-700 mt-0.5 truncate">{previewData.product.productName || "-"}</p>
+                                    </div>
+                                    <div>
+                                        <p className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">LOT No.</p>
+                                        <p className="font-medium text-slate-700 mt-0.5">{previewData.product.baseSKU || "-"}</p>
+                                    </div>
+                                    <div>
+                                        <p className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">HSN Code</p>
+                                        <p className="font-medium text-slate-700 mt-0.5">{previewData.product.hsnCode || "-"}</p>
+                                    </div>
+                                    <div>
+                                        <p className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">Vendor Name</p>
+                                        <p className="font-medium text-slate-700 mt-0.5 truncate">{previewData.product.vendorName || "-"}</p>
+                                    </div>
+                                    <div>
+                                        <p className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">Brand / Unit</p>
+                                        <p className="font-medium text-slate-700 mt-0.5">{previewData.product.brand || "-"} / {previewData.product.unit || "PCS"}</p>
+                                    </div>
+                                </div>
+
+                                <div className="max-h-[220px] overflow-y-auto border rounded-lg bg-white">
+                                    <table className="w-full text-xs text-left border-collapse">
+                                        <thead className="bg-slate-50 sticky top-0 border-b">
+                                            <tr>
+                                                <th className="p-2 font-semibold text-slate-600">Variant Name</th>
+                                                <th className="p-2 font-semibold text-slate-600">Size</th>
+                                                <th className="p-2 font-semibold text-slate-600">SKU Suffix</th>
+                                                <th className="p-2 font-semibold text-slate-600 text-right">Cost Price</th>
+                                                <th className="p-2 font-semibold text-slate-600 text-right">Base Price</th>
+                                                <th className="p-2 font-semibold text-slate-600 text-right">Sale Price IND</th>
+                                                <th className="p-2 font-semibold text-slate-600 text-right">Sale Price INTL</th>
+                                                <th className="p-2 font-semibold text-slate-600 text-center">GST %</th>
+                                                <th className="p-2 font-semibold text-slate-600 text-right">Stock</th>
+                                                <th className="p-2 font-semibold text-slate-600">Warehouse</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {previewData.variants.map((v: any) => (
+                                                <tr key={v.id} className="border-b last:border-0 hover:bg-slate-50/50">
+                                                    <td className="p-2 text-slate-700 font-medium">{v.name}</td>
+                                                    <td className="p-2 text-slate-600">{v.size || "-"}</td>
+                                                    <td className="p-2 text-slate-500 font-mono">{v.sku_suffix || "-"}</td>
+                                                    <td className="p-2 text-slate-700 text-right font-mono">₹{v.costPrice || "0"}</td>
+                                                    <td className="p-2 text-slate-700 text-right font-mono">₹{v.basePrice || "0"}</td>
+                                                    <td className="p-2 text-slate-700 text-right font-mono">₹{v.salesPrice || "0"}</td>
+                                                    <td className="p-2 text-slate-700 text-right font-mono">${v.exportSalesPrice || "0"}</td>
+                                                    <td className="p-2 text-slate-500 text-center font-mono">{v.gstPercentage}%</td>
+                                                    <td className="p-2 text-slate-700 text-right font-mono">{v.stock || "0"}</td>
+                                                    <td className="p-2 text-slate-500 truncate max-w-[120px]">{getWarehouseName(v.warehouseId)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    <DialogFooter className="gap-2 border-t pt-4">
+                        <Button type="button" variant="outline" onClick={() => { setIsImportOpen(false); setPreviewData(null); }}>
+                            Close
+                        </Button>
+                        <Button type="button" disabled={!previewData} onClick={handleImportApply} className="px-6 font-semibold">
+                            Apply to Form
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
         </div>
     )
 }

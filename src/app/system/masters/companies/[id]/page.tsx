@@ -1,7 +1,6 @@
-"use client"
 
 import * as React from "react"
-import { useRouter, useParams } from "next/navigation"
+import { useNavigate, useParams } from "react-router-dom"
 import {
     ArrowLeft,
     Edit,
@@ -14,7 +13,9 @@ import {
     ShieldCheck,
     ExternalLink,
     Loader2,
-    AlertCircle
+    AlertCircle,
+    GitBranch,
+    LayoutGrid
 } from "lucide-react"
 
 import { apiClient } from "@/lib/api-client"
@@ -27,7 +28,7 @@ import {
     CardTitle,
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import Link from "next/link"
+import { Link } from "react-router-dom"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -43,6 +44,26 @@ type OfficeLocation = {
     locationName: string
     address: string
     contactNo: string
+}
+
+type Branch = {
+    id: number
+    companyId: number
+    name: string
+    city: string
+    manager: string
+    status: string
+}
+
+type Department = {
+    id: number
+    companyId: number
+    branchId: number
+    name: string
+    code: string
+    hod: string
+    branch: string
+    status: string
 }
 
 type CompanyDetail = {
@@ -61,11 +82,14 @@ type CompanyDetail = {
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function CompanyDetailPage() {
-    const router = useRouter()
+  const navigate = useNavigate()
+    const router = useNavigate()
     const params = useParams()
     const id = params.id as string
 
     const [company, setCompany] = React.useState<CompanyDetail | null>(null)
+    const [branches, setBranches] = React.useState<Branch[]>([])
+    const [departments, setDepartments] = React.useState<Department[]>([])
     const [isLoading, setIsLoading] = React.useState(true)
     const [error, setError] = React.useState<string | null>(null)
 
@@ -74,6 +98,14 @@ export default function CompanyDetailPage() {
             try {
                 const data = await apiClient.get<CompanyDetail>(`/api/SystemMasters/companies/${id}`)
                 setCompany(data)
+
+                const [branchesData, deptsData] = await Promise.all([
+                    apiClient.get<Branch[]>("/api/SystemMasters/branches").catch(() => []),
+                    apiClient.get<Department[]>("/api/SystemMasters/departments").catch(() => [])
+                ])
+
+                setBranches((branchesData || []).filter(b => b.companyId === data.companyId))
+                setDepartments((deptsData || []).filter(d => d.companyId === data.companyId))
             } catch (err: unknown) {
                 const message = err instanceof Error ? err.message : "Failed to load company details"
                 setError(message)
@@ -101,7 +133,7 @@ export default function CompanyDetailPage() {
                     <h2 className="text-xl font-bold">Error</h2>
                 </div>
                 <p className="text-muted-foreground max-w-md">{error || "Company not found"}</p>
-                <Button onClick={() => router.back()}>
+                <Button onClick={() => navigate(-1)}>
                     <ArrowLeft className="mr-2 h-4 w-4" />
                     Go Back
                 </Button>
@@ -113,7 +145,7 @@ export default function CompanyDetailPage() {
         <div className="flex flex-col gap-6 max-w-6xl mx-auto pb-10">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                    <Button variant="outline" size="icon" onClick={() => router.back()}>
+                    <Button variant="outline" size="icon" onClick={() => navigate(-1)}>
                         <ArrowLeft className="h-4 w-4" />
                     </Button>
                     <div>
@@ -126,7 +158,7 @@ export default function CompanyDetailPage() {
                         </div>
                     </div>
                 </div>
-                <Button render={<Link href={`/system/masters/companies/edit/${id}`} />} nativeButton={false}>
+                <Button render={<Link to={`/system/masters/companies/edit/${id}`} />} nativeButton={false}>
                     <Edit className="mr-2 h-4 w-4" />
                     Edit Profile
                 </Button>
@@ -246,6 +278,64 @@ export default function CompanyDetailPage() {
                                 ))
                             ) : (
                                 <p className="text-sm text-muted-foreground py-4 text-center">No additional office locations listed.</p>
+                            )}
+                        </CardContent>
+                    </Card>
+
+                    {/* Linked Branches */}
+                    <Card className="shadow-sm">
+                        <CardHeader>
+                            <CardTitle className="flex items-center gap-2 text-lg">
+                                <GitBranch className="h-5 w-5 text-emerald-600" />
+                                Branches ({branches.length})
+                            </CardTitle>
+                        </CardHeader>
+                        <CardContent className="grid gap-4">
+                            {branches.length > 0 ? (
+                                <div className="grid gap-3 sm:grid-cols-2">
+                                    {branches.map((b) => (
+                                        <div key={b.id} className="p-4 border rounded-lg hover:bg-muted/30 transition-colors flex justify-between items-start">
+                                            <div>
+                                                <p className="font-bold">{b.name}</p>
+                                                <p className="text-xs text-muted-foreground mt-1">City: {b.city}</p>
+                                                <p className="text-xs text-muted-foreground">Manager: {b.manager || "N/A"}</p>
+                                            </div>
+                                            <Badge variant={b.status === "Active" ? "default" : "secondary"}>
+                                                {b.status || "Active"}
+                                            </Badge>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <p className="text-sm text-muted-foreground py-4 text-center">No branches linked to this company.</p>
+                            )}
+                        </CardContent>
+                    </Card>
+
+                    {/* Linked Departments */}
+                    <Card className="shadow-sm">
+                        <CardHeader>
+                            <CardTitle className="flex items-center gap-2 text-lg">
+                                <LayoutGrid className="h-5 w-5 text-amber-600" />
+                                Departments ({departments.length})
+                            </CardTitle>
+                        </CardHeader>
+                        <CardContent className="grid gap-4">
+                            {departments.length > 0 ? (
+                                <div className="grid gap-3 sm:grid-cols-2">
+                                    {departments.map((d) => (
+                                        <div key={d.id} className="p-4 border rounded-lg hover:bg-muted/30 transition-colors">
+                                            <div className="flex justify-between items-start mb-1">
+                                                <p className="font-bold">{d.name}</p>
+                                                <Badge variant="outline">{d.code}</Badge>
+                                            </div>
+                                            <p className="text-xs text-muted-foreground">Branch: {d.branch}</p>
+                                            <p className="text-xs text-muted-foreground">HOD: {d.hod || "N/A"}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <p className="text-sm text-muted-foreground py-4 text-center">No departments linked to this company.</p>
                             )}
                         </CardContent>
                     </Card>

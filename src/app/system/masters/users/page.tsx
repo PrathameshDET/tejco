@@ -1,8 +1,7 @@
-"use client"
 
 import * as React from "react"
-import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { Link } from "react-router-dom"
+import { useNavigate } from "react-router-dom"
 import {
     ColumnDef,
     ColumnFiltersState,
@@ -25,9 +24,11 @@ import {
     Download,
     Loader2,
     AlertCircle,
+    Upload,
 } from "lucide-react"
 
 import { apiClient, usersApi, systemMastersApi } from "@/lib/api"
+import { ImportUsersDialog } from "./import-users-dialog"
 import { Button } from "@/components/ui/button"
 import {
     DropdownMenu,
@@ -262,7 +263,7 @@ export const columns: ColumnDef<User>[] = [
 ]
 
 export default function UsersPage() {
-    const router = useRouter()
+    const router = useNavigate()
     const [data, setData] = React.useState<User[]>([])
     const [loading, setLoading] = React.useState(true)
     const [error, setError] = React.useState<string | null>(null)
@@ -274,21 +275,38 @@ export default function UsersPage() {
     const [isDeleting, setIsDeleting] = React.useState(false)
     const [userToDelete, setUserToDelete] = React.useState<string | null>(null)
 
-    React.useEffect(() => {
-        async function loadData() {
-            try {
-                const [usersRaw, companies, departments] = await Promise.all([
-                    usersApi.getAll(),
-                    systemMastersApi.getCompanies(),
-                    systemMastersApi.getDepartments()
-                ])
-                setData(usersRaw.map(u => mapApiUser(u, companies, departments)))
-            } catch (err: any) {
-                setError(err.message)
-            } finally {
-                setLoading(false)
-            }
+    // Master data for import validation
+    const [companies, setCompanies] = React.useState<any[]>([])
+    const [branches, setBranches] = React.useState<any[]>([])
+    const [departments, setDepartments] = React.useState<any[]>([])
+    const [isImportOpen, setIsImportOpen] = React.useState(false)
+
+    const loadData = async () => {
+        setLoading(true)
+        try {
+            const [usersRaw, comps, depts, brs] = await Promise.all([
+                usersApi.getAll(),
+                systemMastersApi.getCompanies(),
+                systemMastersApi.getDepartments(),
+                systemMastersApi.getBranches()
+            ])
+            const compsList = Array.isArray(comps) ? comps : ((comps as any)?.data || [])
+            const deptsList = Array.isArray(depts) ? depts : ((depts as any)?.data || [])
+            const brsList = Array.isArray(brs) ? brs : ((brs as any)?.data || [])
+
+            setCompanies(compsList)
+            setDepartments(deptsList)
+            setBranches(brsList)
+
+            setData(usersRaw.map(u => mapApiUser(u, compsList, deptsList)))
+        } catch (err: any) {
+            setError(err.message)
+        } finally {
+            setLoading(false)
         }
+    }
+
+    React.useEffect(() => {
         loadData()
     }, [])
 
@@ -337,11 +355,15 @@ export default function UsersPage() {
                     <p className="text-muted-foreground">Manage system users and employee records within the organization.</p>
                 </div>
                 <div className="flex items-center gap-2">
+                    <Button variant="outline" onClick={() => setIsImportOpen(true)}>
+                        <Upload className="mr-2 h-4 w-4" />
+                        Import
+                    </Button>
                     <Button variant="outline">
                         <Download className="mr-2 h-4 w-4" />
                         Export
                     </Button>
-                    <Button render={<Link href="/system/masters/users/add" />} nativeButton={false}>
+                    <Button render={<Link to="/system/masters/users/add" />} nativeButton={false}>
                         <Plus className="mr-2 h-4 w-4" />
                         Add User / Employee
                     </Button>
@@ -506,6 +528,15 @@ export default function UsersPage() {
                     </DialogFooter>
                 </DialogContent>
             </Dialog>
+
+            <ImportUsersDialog
+                open={isImportOpen}
+                onOpenChange={setIsImportOpen}
+                companies={companies}
+                branches={branches}
+                departments={departments}
+                onImportSuccess={loadData}
+            />
         </div>
     )
 }

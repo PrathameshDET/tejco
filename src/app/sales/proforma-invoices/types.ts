@@ -1,11 +1,12 @@
 import { SalesDocument, SalesDocumentItem } from "../types"
 
 export interface ApiProformaItem {
-  proformaItemId?: number
   proformaInvoiceItemId?: number
-  proformaId?: number
+  proformaItemId?: number
   proformaInvoiceId?: number
+  proformaId?: number
   productId: number
+  variantId?: number | null
   productName: string
   itemName?: string
   imageUrl?: string
@@ -19,36 +20,45 @@ export interface ApiProformaItem {
 }
 
 export interface ApiProforma {
-  proformaId?: number
   proformaInvoiceId?: number
-  proformaNumber?: string
+  proformaId?: number
   piNo?: string
-  proformaDate?: string
+  proformaNumber?: string
   piDate?: string
-  clientName?: string
+  proformaDate?: string
+  clientId?: number
   billingName?: string
-  clientAddress?: string
+  clientName?: string
   billingAddress?: string
+  shippingAddress?: string
+  clientAddress?: string
   clientMobileNo?: string
   subject?: string
   gstinNo?: string
+  clientGSTIN?: string
+  doctorSpeciality?: string[] | string
+  doctorName?: string
   validityDays?: number
   deliveryTime?: string
   deliveryTerms?: string
   paymentTerms?: string
   salesPersonName: string
   salesPersonCell: string
-  salesPersonId?: string
+  salesPersonId?: number | string
   sourceQuotationId?: string
+  linkedQuotationId?: number
   freight?: number
   totalAmount?: number
   status?: string
-  createdAt: string
-  updatedAt: string | null
+  createdAt?: string
+  updatedAt?: string | null
   items: ApiProformaItem[]
+  paymentType?: string
+  currencyType?: string
 }
 
 export interface ProformaInvoiceItem extends SalesDocumentItem {
+  variantId?: number | null
   discountPercentage?: number
   discountAmount?: number
   discountedUnitPrice?: number
@@ -58,9 +68,12 @@ export interface ProformaInvoiceItem extends SalesDocumentItem {
 export interface ProformaInvoice extends Omit<SalesDocument, 'items'> {
   proformaId: number
   proformaNumber: string
+  piNo?: string
+  piDate?: string
+  billingName?: string
   subject: string
   clientMobileNo: string
-  validityDays: number
+  validityDays?: number
   deliveryTime: string
   deliveryTerms?: string
   paymentTerms?: string
@@ -68,8 +81,14 @@ export interface ProformaInvoice extends Omit<SalesDocument, 'items'> {
   salesPersonCell: string
   salesPersonId?: string
   gstinNo?: string
+  clientGSTIN?: string
+  doctorSpeciality?: string
+  doctorName?: string
   sourceQuotationId?: string
+  linkedQuotationId?: number
   freight?: number
+  createdAt?: string
+  updatedAt?: string | null
   items: ProformaInvoiceItem[]
 }
 
@@ -78,19 +97,31 @@ export function mapApiProforma(raw: ApiProforma): ProformaInvoice {
     const itemId = item.proformaInvoiceItemId ?? item.proformaItemId ?? 0
     const price = item.rate ?? item.price ?? 0
     const quantity = item.quantity || 0
-    const discountPercentage = item.discountPercentage || 0
-    const discountAmount = item.hasOwnProperty('discountAmount')
-      ? (item.discountAmount || 0)
-      : (price * discountPercentage / 100)
+    const isForeign = raw.paymentType === "Foreign"
+    const gstRate = isForeign ? 0 : (item.gstPercentage || 0)
+    const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
 
-    const discountedPrice = price - discountAmount
-    const itemSubtotal = discountedPrice * quantity
-    const itemTax = itemSubtotal * (item.gstPercentage || 0) / 100
-    const itemTotal = item.total ?? (itemSubtotal + itemTax)
+    const discountPercentage = item.discountPercentage || 0
+    let discountAmount = 0
+
+    if (item.hasOwnProperty('discountAmount') && item.discountAmount !== undefined && item.discountAmount !== null) {
+      discountAmount = item.discountAmount
+    } else if (discountPercentage > 0) {
+      discountAmount = parseFloat((basePrice * discountPercentage / 100).toFixed(2))
+    }
+
+    const discountedBase = Math.max(0, basePrice - discountAmount)
+    const finalUnitPrice = gstRate > 0 ? discountedBase * (1 + gstRate / 100) : discountedBase
+    const itemTotal = parseFloat((finalUnitPrice * quantity).toFixed(2))
+
+    const rawVid = item.variantId
+    const parsedVid = rawVid !== null && rawVid !== undefined && !isNaN(Number(rawVid)) ? Number(rawVid) : null
+    const finalVid = parsedVid !== null && parsedVid > 0 ? parsedVid : null
 
     return {
       id: String(itemId),
       productId: String(item.productId || itemId),
+      variantId: finalVid,
       productName: item.productName || "",
       name: item.itemName || item.productName || "",
       sku: item.itemName || item.productName || "",
@@ -98,15 +129,31 @@ export function mapApiProforma(raw: ApiProforma): ProformaInvoice {
       unitPrice: price,
       discountPercentage,
       discountAmount,
-      discountedUnitPrice: discountedPrice,
+      discountedUnitPrice: finalUnitPrice,
       gstRate: item.gstPercentage || 0,
       total: itemTotal,
       imageUrl: item.imageUrl || ""
     }
   })
 
-  const subtotal = items.reduce((acc, item) => acc + ((item as any).discountedUnitPrice * item.quantity), 0)
-  const taxAmount = items.reduce((acc, item) => acc + ((item as any).discountedUnitPrice * item.quantity * item.gstRate / 100), 0)
+  const isForeign = raw.paymentType === "Foreign"
+  const subtotal = items.reduce((acc, item) => {
+    const price = item.unitPrice || 0
+    const gstRate = isForeign ? 0 : (item.gstRate || 0)
+    const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+    const discAmt = (item as any).discountAmount || 0
+    const discountedBase = Math.max(0, basePrice - discAmt)
+    return acc + (discountedBase * item.quantity)
+  }, 0)
+
+  const taxAmount = isForeign ? 0 : items.reduce((acc, item) => {
+    const price = item.unitPrice || 0
+    const gstRate = item.gstRate || 0
+    const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+    const discAmt = (item as any).discountAmount || 0
+    const discountedBase = Math.max(0, basePrice - discAmt)
+    return acc + (discountedBase * (gstRate / 100) * item.quantity)
+  }, 0)
 
   const dateValue = raw.piDate || raw.proformaDate || new Date().toISOString()
   const parsedDate = dateValue ? new Date(dateValue) : null
@@ -120,14 +167,28 @@ export function mapApiProforma(raw: ApiProforma): ProformaInvoice {
 
   const numberValue = raw.piNo || raw.proformaNumber || `PI-${idValue || "NEW"}`
   const clientNameValue = raw.billingName || raw.clientName || ""
-  const addressValue = raw.billingAddress || raw.clientAddress || ""
+  const billingAddr = raw.billingAddress || raw.clientAddress || ""
+  const shippingAddr = raw.shippingAddress || billingAddr
+
+  const rawClientId =
+    raw.clientId ??
+    (raw as any).client_id ??
+    (raw as any).clientMasterId ??
+    (raw as any).customerId ??
+    (raw as any).customerMasterId ??
+    (raw as any).client?.id ??
+    (raw as any).client?.clientId
+  const resolvedClientId =
+    rawClientId !== undefined && rawClientId !== null && String(rawClientId).trim() !== "" && String(rawClientId).trim() !== "0"
+      ? String(rawClientId)
+      : ""
 
   return {
     id: finalId,
     proformaId: Number(idValue) || 0,
     number: numberValue,
     proformaNumber: numberValue,
-    clientId: "",
+    clientId: resolvedClientId,
     clientName: clientNameValue,
     date: dateValue.split("T")[0],
     validUntil,
@@ -135,9 +196,9 @@ export function mapApiProforma(raw: ApiProforma): ProformaInvoice {
     items,
     subtotal,
     taxAmount,
-    totalAmount: raw.totalAmount ?? subtotal + taxAmount + (raw.freight || 0),
-    billingAddress: addressValue,
-    shippingAddress: addressValue,
+    totalAmount: subtotal + taxAmount + (raw.freight || 0),
+    billingAddress: billingAddr,
+    shippingAddress: shippingAddr,
     notes: raw.paymentTerms || raw.subject || "",
     subject: raw.subject || raw.paymentTerms || "Proforma Invoice",
     paymentTerms: raw.paymentTerms || raw.subject || "",
@@ -148,8 +209,22 @@ export function mapApiProforma(raw: ApiProforma): ProformaInvoice {
     salesPersonName: raw.salesPersonName || "",
     salesPersonCell: raw.salesPersonCell || "",
     salesPersonId: raw.salesPersonId ? String(raw.salesPersonId) : "",
-    gstinNo: raw.gstinNo || "",
-    sourceQuotationId: raw.sourceQuotationId,
+    gstinNo: raw.clientGSTIN || raw.gstinNo || "",
+    clientGSTIN: raw.clientGSTIN || raw.gstinNo || "",
+    doctorSpeciality: Array.isArray((raw as any).doctorSpeciality)
+      ? (raw as any).doctorSpeciality.join(", ")
+      : ((raw as any).doctorSpeciality || ""),
+    doctorName: raw.doctorName || (raw as any).doctor_name || "",
+    sourceQuotationId: raw.sourceQuotationId
+      || (raw.linkedQuotationId ? String(raw.linkedQuotationId) : undefined),
     freight: raw.freight ?? 0,
+    paymentType: raw.paymentType || "Domestic",
+    currencyType: raw.currencyType || "INR",
+    piNo: numberValue,
+    piDate: dateValue,
+    billingName: clientNameValue,
+    linkedQuotationId: raw.linkedQuotationId,
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
   }
 }

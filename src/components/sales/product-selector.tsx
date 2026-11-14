@@ -1,4 +1,3 @@
-"use client"
 
 import { useState, useEffect } from "react"
 import { Check, ChevronsUpDown, Search, Package } from "lucide-react"
@@ -14,48 +13,92 @@ interface ProductVariant {
   productId: number
   variantName: string
   skuSuffix: string
+  size?: string
   purchasePrice: number
   sellingPrice: number
+  usdAmount?: number
   currentQuantity: number
   variantImage?: string
+  warehouseId?: number
+  rackLocation?: string
 }
 
 interface Product {
   productId: number
   productName: string
   baseSKU: string
+  vendorName?: string
+  hsnCode?: string
   variants: ProductVariant[]
 }
 
 interface ProductSelectorProps {
   onSelect: (product: Product, variant: ProductVariant) => void
+  paymentType?: string
 }
 
-export function ProductSelector({ onSelect }: ProductSelectorProps) {
+export function ProductSelector({ onSelect, paymentType }: ProductSelectorProps) {
   const [open, setOpen] = useState(false)
   const [products, setProducts] = useState<Product[]>([])
   const [searchQuery, setSearchQuery] = useState("")
   const [isLoading, setIsLoading] = useState(false)
 
+  // Fetch products from API whenever dialog opens or search query changes (debounced)
   useEffect(() => {
-    if (open && products.length === 0) {
+    if (!open) return
+
+    const timer = setTimeout(() => {
       setIsLoading(true)
-      apiClient.get<any>("/api/Product/GetAll")
+      const trimmed = searchQuery.trim()
+      const url = trimmed
+        ? `/api/Product/GetAll?SearchTerm=${encodeURIComponent(trimmed)}`
+        : `/api/Product/GetAll`
+
+      apiClient.get<any>(url)
         .then((resp) => {
-          if (resp.success && Array.isArray(resp.data)) {
+          if (resp && resp.success && Array.isArray(resp.data)) {
             setProducts(resp.data)
+          } else if (resp && Array.isArray(resp.data)) {
+            setProducts(resp.data)
+          } else {
+            setProducts([])
           }
         })
+        .catch((err) => {
+          console.error("Failed to fetch products:", err)
+          setProducts([])
+        })
         .finally(() => setIsLoading(false))
-    }
-  }, [open, products.length])
+    }, 300)
+
+    return () => clearTimeout(timer)
+  }, [open, searchQuery])
 
   const flattenedResults: { product: Product, variant: ProductVariant }[] = []
+  const search = (searchQuery || "").toLowerCase().trim()
+
   products.forEach(p => {
-    p.variants.forEach(v => {
-      const fullName = `${p.productName} ${v.variantName}`.toLowerCase()
-      const search = searchQuery.toLowerCase()
-      if (fullName.includes(search) || p.baseSKU.toLowerCase().includes(search) || (p.baseSKU + v.skuSuffix).toLowerCase().includes(search)) {
+    if (!p) return
+    const variants = Array.isArray(p.variants) ? p.variants : []
+    const pName = p.productName || ""
+    const baseSku = p.baseSKU || ""
+    const vendorName = (p as any).vendorName || (p as any).VendorName || ""
+    const hsn = (p as any).hsnCode || (p as any).HSNCode || ""
+
+    variants.forEach(v => {
+      if (!v) return
+      const vName = v.variantName || ""
+      const vSize = (v as any).size || (v as any).Size || ""
+      const skuSuffix = v.skuSuffix || ""
+      const fullSku = `${baseSku}${skuSuffix}`
+
+      const searchableText = `${pName} ${vName} ${vSize} ${vendorName} ${hsn} ${baseSku} ${fullSku}`.toLowerCase()
+      // If server filtered products by SearchTerm, or client matches product / variant info
+      const matchesSearch = !search ||
+        searchableText.includes(search) ||
+        pName.toLowerCase().includes(search)
+
+      if (matchesSearch) {
         flattenedResults.push({ product: p, variant: v })
       }
     })
@@ -87,7 +130,7 @@ export function ProductSelector({ onSelect }: ProductSelectorProps) {
         </DialogHeader>
         <div className="p-2">
           <Input
-            placeholder="Search by name, SKU..."
+            placeholder="Search by name, HSN..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="h-9"
@@ -109,13 +152,25 @@ export function ProductSelector({ onSelect }: ProductSelectorProps) {
                   >
                     <div className="flex flex-col">
                       <div className="font-medium text-primary">{item.product.productName}</div>
-                      <div className="text-xs text-muted-foreground">
-                        {item.variant.variantName} | SKU: {item.product.baseSKU}{item.variant.skuSuffix}
+                      <div className="text-xs text-muted-foreground flex items-center gap-1.5 flex-wrap">
+                        <span>{item.variant.variantName}</span>
+                        {item.variant.size && (
+                          <span className="font-semibold text-foreground/80 px-1 py-0.2 rounded bg-muted/60 text-[10px]">
+                            {item.variant.size}
+                          </span>
+                        )}
+                        <span>| HSN: {item.product.hsnCode || (item.product as any).HSNCode || "—"}</span>
                       </div>
                     </div>
                     <div className="flex flex-col items-end">
-                      <div className="font-semibold">₹{item.variant.sellingPrice.toLocaleString()}</div>
-                      <div className="text-[10px] text-muted-foreground">Stock: {item.variant.currentQuantity}</div>
+                      <div className="font-semibold">
+                        {paymentType === "Foreign"
+                          ? `$${(item.variant.usdAmount ?? 0).toLocaleString()}`
+                          : `₹${(item.variant.sellingPrice ?? 0).toLocaleString()}`}
+                      </div>
+                      <div className="text-[10px] text-muted-foreground font-medium">
+                        Stock: {(item.variant as any).availableStock ?? (Number(item.variant.currentQuantity || 0) - Number((item.variant as any).reservedQuantity || 0))}
+                      </div>
                     </div>
                   </button>
                 ))}

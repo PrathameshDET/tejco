@@ -1,9 +1,10 @@
-"use client"
 
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useNavigate, useLocation } from "react-router-dom"
 import { Loader2, Lock, Mail, Eye, EyeOff, ShieldCheck } from "lucide-react"
-import { authApi, usersApi } from "@/lib/api"
+import { authApi, usersApi, rolesApi } from "@/lib/api"
+import { useAuth } from "@/hooks/use-auth"
+import { extractPermissionNames } from "@/lib/rbac"
 import { Button } from "@/components/ui/button"
 import {
     Card,
@@ -18,7 +19,9 @@ import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
 
 export default function LoginPage() {
-    const router = useRouter()
+    const navigate = useNavigate()
+    const location = useLocation()
+    const { login } = useAuth()
     const [isLoading, setIsLoading] = React.useState(false)
     const [showPassword, setShowPassword] = React.useState(false)
     const [formData, setFormData] = React.useState({
@@ -32,35 +35,129 @@ export default function LoginPage() {
 
         try {
             const loginResponse = await authApi.login(formData)
-            
+
             // Extract token
             const token = loginResponse.token || loginResponse.data?.token || loginResponse.accessToken || (typeof loginResponse === 'string' ? loginResponse : null)
-            
+
             if (!token) {
                 throw new Error("Invalid response from server. No token received.")
             }
 
-            // Save token in localStorage and Cookie (Middleware needs the cookie)
+            // Temporarily store token so subsequent apiClient calls include Authorization: Bearer <token>
             localStorage.setItem("tejco_auth_token", token)
-            document.cookie = `tejco_auth_token=${token}; path=/; max-age=86400; SameSite=Lax`
 
-            // Fetch full user details by email
+            // Extract user and permissions directly from login response if available
+            const loginUser = loginResponse.user || loginResponse.data?.user
+            const loginPerms = loginResponse.permissions || loginResponse.data?.permissions
+
+            // Fetch full user details by email if possible to enrich user profile
+            let userData: any = loginUser ? { ...loginUser } : null
             try {
                 const userRes = await usersApi.getByEmail(formData.username)
-                const userData = userRes.data || userRes
-                localStorage.setItem("tejco_user", JSON.stringify(userData))
+                const fullUser = userRes.data || userRes
+                if (fullUser) {
+                    userData = { ...(loginUser || {}), ...fullUser }
+                }
             } catch (userErr) {
-                console.error("Failed to fetch user details:", userErr)
+                console.warn("Could not fetch user details by email:", userErr)
             }
 
+            // Extract roleId (from loginResponse, loginUser, or userData)
+            const roleId = Number(loginResponse?.roleId ?? loginUser?.roleId ?? userData?.roleId ?? loginResponse?.data?.roleId ?? 1)
+
+            // Resolve role name if not present in userData
+            if (userData && !userData.role) {
+                if (loginUser?.role) {
+                    userData.role = loginUser.role
+                } else {
+                    try {
+                        const roleRes: any = await rolesApi.getById(roleId)
+                        const roleObj = roleRes?.data || roleRes
+                        if (roleObj?.roleName) {
+                            userData.role = roleObj.roleName
+                        }
+                    } catch {
+                        userData.role = roleId === 1 ? "Administrator" : `Role-${roleId}`
+                    }
+                }
+            }
+
+            // Standardize full user identity attributes
+            const userId = userData?.userId ?? userData?.id ?? loginUser?.userId ?? loginUser?.id ?? 1
+            const fullName = (userData?.name || `${userData?.firstName || ""} ${userData?.lastName || ""}`.trim()) || userData?.username || formData.username
+            const phone = userData?.phone || userData?.mobile || userData?.mobileNumber || ""
+
+            userData = {
+                ...(userData || {}),
+                userId,
+                id: userId,
+                name: fullName,
+                phone,
+                mobile: phone,
+                roleId,
+                email: userData?.email || formData.username
+            }
+
+            // Extract permissions: prefer loginResponse.permissions, fallback to rolesApi.getRolePermissions
+            let userPermissions: string[] = []
+            if (loginPerms && Array.isArray(loginPerms) && loginPerms.length > 0) {
+                userPermissions = extractPermissionNames(loginPerms)
+            } else {
+                try {
+                    const permRes: any = await rolesApi.getRolePermissions(roleId)
+                    const rawPerms = Array.isArray(permRes) ? permRes : permRes?.data || []
+                    userPermissions = extractPermissionNames(rawPerms)
+                } catch (permErr) {
+                    console.error(`Failed to fetch permissions for roleId ${roleId}:`, permErr)
+                }
+            }
+
+            // If user is Administrator (roleId 1) and no specific permissions returned, fallback to wildcard
+            if (userPermissions.length === 0 && (roleId === 1 || userData?.role?.toLowerCase() === "administrator")) {
+                userPermissions = ["*"]
+            }
+
+            // Update auth context state, storage, cookies, and activity timestamp
+            login(token, userData, userPermissions)
+
             toast.success("Login successful! Welcome back.")
-            router.push("/")
+            // Redirect to the page the user originally tried to visit
+            const from = (location.state as any)?.from?.pathname ?? "/"
+            navigate(from, { replace: true })
         } catch (err: any) {
             const message = err.message || "Invalid username or password"
             toast.error(message)
         } finally {
             setIsLoading(false)
         }
+    }
+
+    const handleDevBypass = () => {
+        setIsLoading(true)
+        const mockToken = "dev-bypass-token"
+        const mockUser = {
+            userId: 1,
+            id: 1,
+            name: "Developer User",
+            firstName: "Developer",
+            lastName: "User",
+            email: "dev@tejco.com",
+            role: "Administrator",
+            roleId: 1,
+            permissions: ["*"],
+            phone: "+91 98765 43210",
+            mobile: "+91 98765 43210",
+            company: "Tejco Group (Dev)",
+            branch: "Mumbai HO",
+            department: "IT Infrastructure",
+            imageUrl: null,
+            createdAt: new Date().toISOString()
+        }
+        login(mockToken, mockUser, ["*"])
+        toast.success("Bypassed login (Dev Mode)")
+        const from = (location.state as any)?.from?.pathname ?? "/"
+        navigate(from, { replace: true })
+        setIsLoading(false)
     }
 
     return (
@@ -113,6 +210,7 @@ export default function LoginPage() {
                                 <Lock className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
                                 <Input
                                     id="password"
+                                    placeholder="password"
                                     type={showPassword ? "text" : "password"}
                                     required
                                     className="pl-10 pr-10 h-11 bg-white dark:bg-slate-950"
@@ -134,6 +232,17 @@ export default function LoginPage() {
                             {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
                             Sign In
                         </Button>
+                        {import.meta.env.DEV && (
+                            <Button
+                                type="button"
+                                variant="outline"
+                                className="w-full h-11 text-base font-medium border-dashed border-primary/40 hover:border-primary hover:bg-primary/5 transition-all text-primary"
+                                onClick={handleDevBypass}
+                                disabled={isLoading}
+                            >
+                                Dev Mode: Bypass Login
+                            </Button>
+                        )}
                         <p className="text-center text-sm text-muted-foreground">
                             Don&apos;t have an account?{" "}
                             <Button variant="link" className="p-0 h-auto font-semibold text-primary">

@@ -1,33 +1,69 @@
-import { notFound } from "next/navigation"
-import { MOCK_VENDORS } from "../data"
+import { useState, useEffect } from "react"
+import { useParams, Link } from "react-router-dom"
+import { vendorsApi } from "@/lib/api"
+import { Vendor } from "../types"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Separator } from "@/components/ui/separator"
 import { Building2, Mail, MapPin, Phone, ReceiptText, ArrowLeft } from "lucide-react"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Card, CardContent } from "@/components/ui/card"
-import Link from "next/link"
 import { Button } from "@/components/ui/button"
+import { Skeleton } from "@/components/ui/skeleton"
 
-export default async function VendorDetailsPage(props: { params: Promise<{ id: string }> }) {
-  const params = await props.params
-  const vendor = MOCK_VENDORS.find((v) => v.id === params.id)
+export default function VendorDetailsPage() {
+  const params = useParams()
+  const [vendor, setVendor] = useState<Vendor | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    if (params.id) {
+      setIsLoading(true)
+      vendorsApi
+        .getById(params.id)
+        .then((data) => setVendor(data))
+        .catch((err) => {
+          console.error("Failed to fetch vendor details:", err)
+          setVendor(null)
+        })
+        .finally(() => setIsLoading(false))
+    }
+  }, [params.id])
+
+  if (isLoading) {
+    return (
+      <div className="flex flex-col gap-6">
+        <Skeleton className="h-10 w-64" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    )
+  }
 
   if (!vendor) {
-    notFound()
+    return (
+      <div className="flex min-h-[50vh] flex-col items-center justify-center space-y-2">
+        <h2 className="text-xl font-bold">Vendor Not Found</h2>
+        <p className="text-muted-foreground">The vendor you are looking for does not exist.</p>
+      </div>
+    )
   }
 
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center gap-4">
-        <Link href="/supply-chain/vendors">
+        <Link to="/supply-chain/vendors">
           <Button variant="outline" size="icon">
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-3">
-            <h1 className="text-3xl font-bold tracking-tight">{vendor.name}</h1>
+            <h1 className="text-3xl font-bold tracking-tight">{vendor.vendorName || vendor.name}</h1>
+            {vendor.vendorPrefix && (
+              <Badge variant="outline" className="font-mono text-xs px-2 py-0.5 border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300">
+                Prefix: {vendor.vendorPrefix}
+              </Badge>
+            )}
             <Badge variant={vendor.status === "Active" ? "default" : "secondary"} className="text-sm">
               {vendor.status}
             </Badge>
@@ -37,7 +73,7 @@ export default async function VendorDetailsPage(props: { params: Promise<{ id: s
       </div>
 
       <Card className="flex flex-col h-full shadow-sm">
-        <Tabs defaultValue="overview" className="flex-1 flex flex-col pt-2">
+        <Tabs defaultValue="overview" className="flex-1 flex flex-col">
           <div className="px-6 border-b">
             <TabsList className="w-full justify-start rounded-none bg-transparent p-0">
               <TabsTrigger
@@ -46,24 +82,24 @@ export default async function VendorDetailsPage(props: { params: Promise<{ id: s
               >
                 Overview
               </TabsTrigger>
-              <TabsTrigger
+              {/* <TabsTrigger
                 value="products"
                 className="relative h-full rounded-none border-b-2 border-b-transparent bg-transparent px-4 pb-3 pt-2 font-medium text-muted-foreground shadow-none transition-none data-[state=active]:border-b-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
               >
                 Products Supplied
-              </TabsTrigger>
+              </TabsTrigger> */}
               <TabsTrigger
                 value="history"
                 className="relative h-full rounded-none border-b-2 border-b-transparent bg-transparent px-4 pb-3 pt-2 font-medium text-muted-foreground shadow-none transition-none data-[state=active]:border-b-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
               >
                 Purchase History
               </TabsTrigger>
-              <TabsTrigger
+              {/* <TabsTriggerf
                 value="payments"
                 className="relative h-full rounded-none border-b-2 border-b-transparent bg-transparent px-4 pb-3 pt-2 font-medium text-muted-foreground shadow-none transition-none data-[state=active]:border-b-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
               >
                 Payment Ledger
-              </TabsTrigger>
+              </TabsTrigger> */}
             </TabsList>
           </div>
 
@@ -79,7 +115,7 @@ export default async function VendorDetailsPage(props: { params: Promise<{ id: s
                       </div>
                       <div>
                         <p className="text-sm font-medium leading-none mb-1">Contact Person</p>
-                        <p className="text-sm text-muted-foreground">{vendor.contactPerson || "N/A"}</p>
+                        <p className="text-sm text-muted-foreground">{vendor.contactPersonName || vendor.contactPerson || "N/A"}</p>
                       </div>
                     </div>
 
@@ -89,9 +125,13 @@ export default async function VendorDetailsPage(props: { params: Promise<{ id: s
                       </div>
                       <div>
                         <p className="text-sm font-medium leading-none mb-1">Email Address</p>
-                        <a href={`mailto:${vendor.email}`} className="text-sm text-blue-600 hover:underline">
-                          {vendor.email || "N/A"}
-                        </a>
+                        {vendor.email ? (
+                          <a href={`mailto:${vendor.email}`} className="text-sm text-blue-600 hover:underline">
+                            {vendor.email}
+                          </a>
+                        ) : (
+                          <p className="text-sm text-muted-foreground">N/A</p>
+                        )}
                       </div>
                     </div>
 
@@ -100,10 +140,14 @@ export default async function VendorDetailsPage(props: { params: Promise<{ id: s
                         <Phone className="h-5 w-5 text-muted-foreground" />
                       </div>
                       <div>
-                        <p className="text-sm font-medium leading-none mb-1">Phone Number</p>
-                        <a href={`tel:${vendor.phone}`} className="text-sm text-blue-600 hover:underline">
-                          {vendor.phone || "N/A"}
-                        </a>
+                        <p className="text-sm font-medium leading-none mb-1">Mobile / Phone Number</p>
+                        {(vendor.mobileNumber || vendor.phone) ? (
+                          <a href={`tel:${vendor.mobileNumber || vendor.phone}`} className="text-sm text-blue-600 hover:underline font-mono">
+                            {vendor.mobileNumber || vendor.phone}
+                          </a>
+                        ) : (
+                          <p className="text-sm text-muted-foreground">N/A</p>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -112,6 +156,18 @@ export default async function VendorDetailsPage(props: { params: Promise<{ id: s
                 <div className="space-y-4">
                   <h3 className="text-base font-semibold border-b pb-2">Business Details</h3>
                   <div className="grid gap-4">
+                    {vendor.vendorPrefix && (
+                      <div className="flex items-center gap-3">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-md bg-muted/50">
+                          <ReceiptText className="h-5 w-5 text-amber-600" />
+                        </div>
+                        <div>
+                          <p className="text-sm font-medium leading-none mb-1">Vendor Prefix</p>
+                          <p className="text-sm font-mono font-semibold text-amber-700 dark:text-amber-400">{vendor.vendorPrefix}</p>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="flex items-center gap-3">
                       <div className="flex h-9 w-9 items-center justify-center rounded-md bg-muted/50">
                         <ReceiptText className="h-5 w-5 text-muted-foreground" />

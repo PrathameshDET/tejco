@@ -1,11 +1,12 @@
-"use client"
 
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useNavigate } from "react-router-dom"
 import {
   AlertCircle,
   CheckCircle2,
   ClipboardList,
+  ChevronDown,
+  ChevronRight,
   Filter,
   MapPin,
   PackageCheck,
@@ -28,8 +29,8 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { mockDispatches } from "./mock-data"
-import { getDispatchReadiness, type DispatchStatus, type OrderDispatch } from "./types"
+import { getDispatchReadiness, mapApiDispatch, type DispatchStatus, type OrderDispatch } from "./types"
+import { dispatchApi } from "@/lib/api"
 
 const tabFilters: Array<{ label: string; value: "all" | DispatchStatus }> = [
   { label: "All", value: "all" },
@@ -70,14 +71,14 @@ function DispatchStat({
 }) {
   return (
     <Card>
-      <CardContent className="flex items-center justify-between p-5">
+      <CardContent className="flex items-center justify-between p-3.5">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
-          <p className="mt-2 text-2xl font-bold">{value}</p>
-          <p className="mt-1 text-xs text-muted-foreground">{description}</p>
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</p>
+          <p className="mt-1 text-xl font-bold">{value}</p>
+          <p className="text-[10px] text-muted-foreground mt-0.5">{description}</p>
         </div>
-        <div className="flex h-11 w-11 items-center justify-center rounded-lg border bg-muted/40">
-          <Icon className="h-5 w-5 text-primary" />
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg border bg-muted/30">
+          <Icon className="h-4.5 w-4.5 text-primary" />
         </div>
       </CardContent>
     </Card>
@@ -85,10 +86,35 @@ function DispatchStat({
 }
 
 export default function DispatchPage() {
-  const router = useRouter()
-  const [dispatches] = React.useState<OrderDispatch[]>(mockDispatches)
+  const navigate = useNavigate()
+  const router = useNavigate()
+  const [dispatches, setDispatches] = React.useState<OrderDispatch[]>([])
+  const [isLoading, setIsLoading] = React.useState(true)
   const [activeTab, setActiveTab] = React.useState<"all" | DispatchStatus>("all")
   const [searchQuery, setSearchQuery] = React.useState("")
+  const [expandedOrders, setExpandedOrders] = React.useState<Record<string, boolean>>({})
+
+  const toggleOrderExpand = (orderId: string) => {
+    setExpandedOrders(prev => ({ ...prev, [orderId]: !prev[orderId] }))
+  }
+
+  const fetchDispatches = React.useCallback(async () => {
+    setIsLoading(true)
+    try {
+      const res = await dispatchApi.getAll()
+      const rawList = Array.isArray(res) ? res : ((res as any)?.data && Array.isArray((res as any).data) ? (res as any).data : [])
+      setDispatches(rawList.map(mapApiDispatch))
+    } catch (err) {
+      console.error("Failed to load dispatches:", err)
+      setDispatches([])
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    fetchDispatches()
+  }, [fetchDispatches])
 
   const filteredDispatches = dispatches.filter((dispatch) => {
     const query = searchQuery.toLowerCase()
@@ -108,6 +134,16 @@ export default function DispatchPage() {
   const deliveredCount = dispatches.filter((dispatch) => dispatch.status === "Delivered").length
   const exceptionCount = dispatches.filter((dispatch) => dispatch.status === "Exception").length
 
+  const nextReadyDispatchId = dispatches.find((d) => d.status === "Ready")?.id
+
+  // Group dispatches by orderId
+  const groupedDispatchesMap = new Map<string, OrderDispatch[]>()
+  filteredDispatches.forEach((dispatch) => {
+    const list = groupedDispatchesMap.get(dispatch.orderId || "") || []
+    list.push(dispatch)
+    groupedDispatchesMap.set(dispatch.orderId || "", list)
+  })
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -123,7 +159,11 @@ export default function DispatchPage() {
             Record delivery partners, tracking numbers, package details, and delivery progress.
           </p>
         </div>
-        <Button className="gap-2" onClick={() => router.push("/inventory/dispatch/disp-9281")}>
+        <Button 
+          className="gap-2" 
+          onClick={() => navigate(`/inventory/dispatch/${nextReadyDispatchId}`)}
+          disabled={!nextReadyDispatchId}
+        >
           <Truck className="h-4 w-4" />
           Dispatch Next Ready Order
         </Button>
@@ -167,7 +207,7 @@ export default function DispatchPage() {
 
         <TabsContent value={activeTab} className="mt-6">
           <Card>
-            <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between py-4">
               <div>
                 <CardTitle className="text-lg">Dispatch Register</CardTitle>
                 <CardDescription>Track packed orders through courier handoff and delivery.</CardDescription>
@@ -177,7 +217,7 @@ export default function DispatchPage() {
                 Dispatch-ready orders originate from completed outward scans
               </div>
             </CardHeader>
-            <CardContent>
+            <CardContent className="py-4">
               <Table>
                 <TableHeader className="bg-muted/50">
                   <TableRow>
@@ -199,64 +239,183 @@ export default function DispatchPage() {
                       </TableCell>
                     </TableRow>
                   ) : (
-                    filteredDispatches.map((dispatch) => {
-                      const readiness = getDispatchReadiness(dispatch)
+                    Array.from(groupedDispatchesMap.entries()).map(([orderId, list]) => {
+                      const representative = list[0]
+                      const isExpanded = !!expandedOrders[orderId]
+                      const hasMultipleDispatches = list.length > 1
 
-                      return (
-                        <TableRow key={dispatch.id}>
-                          <TableCell>
-                            <div className="font-semibold text-primary">{dispatch.orderNumber}</div>
-                            <div className="text-xs text-muted-foreground">
-                              {dispatch.dispatchDate ? new Date(dispatch.dispatchDate).toLocaleDateString("en-GB") : "No date"}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="font-medium">{dispatch.clientName}</div>
-                            <div className="line-clamp-1 max-w-[260px] text-xs text-muted-foreground">
-                              <MapPin className="mr-1 inline h-3 w-3" />
-                              {dispatch.shippingAddress}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex items-center gap-2">
-                              <Warehouse className="h-4 w-4 text-muted-foreground" />
-                              <div>
-                                <div className="text-sm font-medium">{dispatch.warehouseCode}</div>
-                                <div className="text-xs text-muted-foreground">{dispatch.warehouseName}</div>
+                      if (!hasMultipleDispatches) {
+                        const dispatch = representative
+                        const readiness = getDispatchReadiness(dispatch)
+                        return (
+                          <TableRow key={dispatch.id}>
+                            <TableCell>
+                              <div className="font-semibold text-primary">
+                                {dispatch.orderNumber} <span className="text-xs text-muted-foreground font-normal">(ID: {dispatch.orderId})</span>
                               </div>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="font-medium">{dispatch.partnerName || "Not assigned"}</div>
-                            <div className="font-mono text-xs text-muted-foreground">
-                              {dispatch.trackingNumber || "Tracking pending"}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="font-medium">{dispatch.packageCount} pkg</div>
-                            <div className="text-xs text-muted-foreground">
-                              {dispatch.grossWeightKg ? `${dispatch.grossWeightKg} kg` : "Weight pending"}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <Progress value={readiness.percent} className="w-[160px]">
-                              <ProgressLabel>{readiness.complete}/{readiness.total} fields</ProgressLabel>
-                              <span className="ml-auto text-sm text-muted-foreground tabular-nums">{readiness.percent}%</span>
-                            </Progress>
-                          </TableCell>
-                          <TableCell>{getStatusBadge(dispatch.status)}</TableCell>
-                          <TableCell className="text-right">
-                            <Button
-                              size="sm"
-                              variant={dispatch.status === "Ready" ? "default" : "outline"}
-                              className="gap-2"
-                              onClick={() => router.push(`/inventory/dispatch/${dispatch.id}`)}
-                            >
-                              <Truck className="h-4 w-4" />
-                              {dispatch.status === "Ready" ? "Create Dispatch" : "View Dispatch"}
-                            </Button>
-                          </TableCell>
-                        </TableRow>
+                              <div className="text-xs text-muted-foreground">
+                                {dispatch.dispatchDate ? new Date(dispatch.dispatchDate).toLocaleDateString("en-GB") : "No date"}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="font-medium">{dispatch.clientName}</div>
+                              <div className="line-clamp-1 max-w-[260px] text-xs text-muted-foreground">
+                                <MapPin className="mr-1 inline h-3 w-3" />
+                                {dispatch.shippingAddress}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center gap-2">
+                                <Warehouse className="h-4 w-4 text-muted-foreground" />
+                                <div>
+                                  <div className="text-sm font-medium">{dispatch.warehouseCode}</div>
+                                  <div className="text-xs text-muted-foreground">{dispatch.warehouseName}</div>
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="font-medium">{dispatch.partnerName || "Not assigned"}</div>
+                              <div className="font-mono text-xs text-muted-foreground">
+                                {dispatch.trackingNumber || "Tracking pending"}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="font-medium">{dispatch.packageCount} pkg</div>
+                              <div className="text-xs text-muted-foreground">
+                                {dispatch.grossWeightKg ? `${dispatch.grossWeightKg} kg` : "Weight pending"}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <Progress value={readiness.percent} className="w-[160px]">
+                                <ProgressLabel>{readiness.complete}/{readiness.total} fields</ProgressLabel>
+                                <span className="ml-auto text-sm text-muted-foreground tabular-nums">{readiness.percent}%</span>
+                              </Progress>
+                            </TableCell>
+                            <TableCell>{getStatusBadge(dispatch.status)}</TableCell>
+                            <TableCell className="text-right">
+                              <Button
+                                size="sm"
+                                variant={dispatch.status === "Ready" ? "default" : "outline"}
+                                className="gap-2"
+                                onClick={() => navigate(`/inventory/dispatch/${dispatch.id}`)}
+                              >
+                                <Truck className="h-4 w-4" />
+                                {dispatch.status === "Ready" ? "Create Dispatch" : "View Dispatch"}
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      }
+
+                      // Render grouped dispatch runs
+                      return (
+                        <React.Fragment key={orderId}>
+                          <TableRow className="bg-muted/30 font-medium hover:bg-muted/40 border-l-4 border-l-primary">
+                            <TableCell>
+                              <div className="flex items-center gap-2">
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-8 w-8 p-0"
+                                  onClick={() => toggleOrderExpand(orderId)}
+                                >
+                                  {isExpanded ? (
+                                    <ChevronDown className="h-4 w-4" />
+                                  ) : (
+                                    <ChevronRight className="h-4 w-4" />
+                                  )}
+                                </Button>
+                                <div>
+                                  <div className="font-semibold text-primary">
+                                    {representative.orderNumber} <span className="text-xs text-muted-foreground font-normal">(ID: {representative.orderId})</span>
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    {representative.dispatchDate ? new Date(representative.dispatchDate).toLocaleDateString("en-GB") : "No date"}
+                                  </div>
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="font-medium">{representative.clientName}</div>
+                              <div className="line-clamp-1 max-w-[260px] text-xs text-muted-foreground">
+                                <MapPin className="mr-1 inline h-3 w-3" />
+                                {representative.shippingAddress}
+                              </div>
+                            </TableCell>
+                            <TableCell colSpan={2}>
+                              <div className="flex items-center gap-2">
+                                <Badge className="bg-primary/10 text-primary hover:bg-primary/20 border-primary/20">
+                                  {list.length} Dispatch Deliveries
+                                </Badge>
+                              </div>
+                            </TableCell>
+                            <TableCell colSpan={2} />
+                            <TableCell>
+                              <Badge variant="outline" className="bg-background">Batch Group</Badge>
+                            </TableCell>
+                            <TableCell className="text-right">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-8 text-xs font-semibold text-primary"
+                                onClick={() => toggleOrderExpand(orderId)}
+                              >
+                                {isExpanded ? "Hide Dispatches" : "Show Dispatches"}
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+
+                          {isExpanded && list.map((dispatch, runIdx) => {
+                            const readiness = getDispatchReadiness(dispatch)
+                            return (
+                              <TableRow key={dispatch.id} className="bg-muted/10 border-l-4 border-l-primary/40 hover:bg-muted/15">
+                                <TableCell className="pl-12">
+                                  <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                                    Run #{list.length - runIdx} (ID: {dispatch.id})
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="text-xs text-muted-foreground">
+                                    Warehouse: <span className="font-medium text-foreground">{dispatch.warehouseCode}</span>
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="text-xs text-muted-foreground line-clamp-1">{dispatch.warehouseName}</div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="text-xs text-muted-foreground font-medium">{dispatch.partnerName || "Not assigned"}</div>
+                                  <div className="text-[10px] font-mono text-muted-foreground truncate max-w-[120px]">
+                                    {dispatch.trackingNumber || "No tracking"}
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="text-xs font-medium">{dispatch.packageCount} pkg</div>
+                                  <div className="text-[10px] text-muted-foreground">
+                                    {dispatch.grossWeightKg ? `${dispatch.grossWeightKg} kg` : "—"}
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <Progress value={readiness.percent} className="w-[160px]">
+                                    <ProgressLabel>{readiness.complete}/{readiness.total} fields</ProgressLabel>
+                                    <span className="ml-auto text-xs text-muted-foreground tabular-nums">{readiness.percent}%</span>
+                                  </Progress>
+                                </TableCell>
+                                <TableCell>{getStatusBadge(dispatch.status)}</TableCell>
+                                <TableCell className="text-right">
+                                  <Button
+                                    size="sm"
+                                    variant={dispatch.status === "Ready" ? "default" : "outline"}
+                                    className="gap-2 h-8 text-xs"
+                                    onClick={() => navigate(`/inventory/dispatch/${dispatch.id}`)}
+                                  >
+                                    <Truck className="h-3.5 w-3.5" />
+                                    {dispatch.status === "Ready" ? "Create" : "View"}
+                                  </Button>
+                                </TableCell>
+                              </TableRow>
+                            )
+                          })}
+                        </React.Fragment>
                       )
                     })
                   )}

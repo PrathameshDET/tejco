@@ -4,6 +4,7 @@ export interface ApiQuotationItem {
   quotationItemId: number
   quotationId: number
   productId: number
+  variantId?: number
   productName: string
   itemName: string
   imageUrl: string
@@ -19,25 +20,34 @@ export interface ApiQuotation {
   quotationNumber: string
   quotationDate: string
   clientName: string
-  clientAddress: string
+  clientAddress?: string
+  billingAddress?: string
+  shippingAddress?: string
   clientMobileNo: string
   subject: string
   gstinNo: string
   validityDays: number
   deliveryTime: string
+  salesPersonId?: number | string
   salesPersonName: string
   salesPersonCell: string
-  salesPersonId?: string
   status?: string
   createdAt: string
   updatedAt: string | null
+  totalAmount?: number
+  paymentType?: string
+  currencyType?: string
+  doctorSpeciality?: string[] | string
+  doctorName?: string
   items: ApiQuotationItem[]
 }
 
 export interface Quotation extends SalesDocument {
   quotationId: number
   quotationNumber: string
+  quotationDate?: string
   subject: string
+  clientAddress?: string
   clientMobileNo: string
   validityDays: number
   deliveryTime: string
@@ -45,50 +55,85 @@ export interface Quotation extends SalesDocument {
   salesPersonCell: string
   salesPersonId?: string
   gstinNo?: string
+  createdAt?: string
+  updatedAt?: string | null
+  totalAmount: number
+  paymentType?: string
+  currencyType?: string
+  doctorSpeciality?: string
+  doctorName?: string
 }
 
 export function mapApiQuotation(raw: ApiQuotation): Quotation {
-  // Calculate totals incorporating discounts
+  const isForeign = (raw as any).paymentType === "Foreign"
+
+  // Calculate totals: minus GST from price -> apply discount -> apply GST on discounted amount
   const items = raw.items.map(item => {
     const price = item.price || 0
     const quantity = item.quantity || 0
+    const gstRate = isForeign ? 0 : (item.gstPercentage || 0)
     const discountPercentage = item.discountPercentage || 0
-    // If discountAmount is provided use it, otherwise calculate it
-    const discountAmount = item.hasOwnProperty('discountAmount') 
-      ? (item.discountAmount || 0) 
-      : (price * discountPercentage / 100)
-    
-    const discountedPrice = price - discountAmount
-    const itemSubtotal = discountedPrice * quantity
-    const itemTax = itemSubtotal * (item.gstPercentage || 0) / 100
-    const itemTotal = itemSubtotal + itemTax
+
+    // 1. Minus GST from price to get base price
+    const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+
+    // 2. Discount on base price
+    const discountAmount = item.hasOwnProperty('discountAmount') && item.discountAmount !== undefined && item.discountAmount !== null
+      ? (item.discountAmount || 0)
+      : parseFloat((basePrice * (discountPercentage / 100)).toFixed(2))
+
+    // 3. Discounted base price
+    const discountedBase = Math.max(0, basePrice - discountAmount)
+
+    // 4. Apply GST % on discounted base amount to get final total
+    const finalUnitPrice = gstRate > 0 ? discountedBase * (1 + gstRate / 100) : discountedBase
+    const itemTotal = parseFloat((finalUnitPrice * quantity).toFixed(2))
 
     return {
       id: String(item.quotationItemId),
+      quotationItemId: item.quotationItemId,
       productId: String(item.productId || item.quotationItemId),
+      variantId: (item as any).variantId || 0,
       productName: item.productName,
       name: item.itemName,
-      sku: item.itemName, // The API doesn't seem to have a separate SKU field, using itemName as fallback
+      sku: item.itemName,
       quantity,
       unitPrice: price,
       discountPercentage,
       discountAmount,
-      discountedUnitPrice: discountedPrice,
+      discountedUnitPrice: finalUnitPrice,
       gstRate: item.gstPercentage,
       total: itemTotal,
       imageUrl: item.imageUrl
     }
   })
 
-  const subtotal = items.reduce((acc, item) => acc + (item.discountedUnitPrice * item.quantity), 0)
-  const taxAmount = items.reduce((acc, item) => acc + (item.discountedUnitPrice * item.quantity * item.gstRate / 100), 0)
+  const subtotal = items.reduce((acc, item) => {
+    const price = item.unitPrice || 0
+    const gstRate = isForeign ? 0 : (item.gstRate || 0)
+    const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+    const discAmt = (item as any).discountAmount || 0
+    const discountedBase = Math.max(0, basePrice - discAmt)
+    return acc + (discountedBase * item.quantity)
+  }, 0)
+
+  const taxAmount = isForeign ? 0 : items.reduce((acc, item) => {
+    const price = item.unitPrice || 0
+    const gstRate = item.gstRate || 0
+    const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+    const discAmt = (item as any).discountAmount || 0
+    const discountedBase = Math.max(0, basePrice - discAmt)
+    return acc + (discountedBase * (gstRate / 100) * item.quantity)
+  }, 0)
+
+  const totalAmount = subtotal + taxAmount
 
   return {
     id: String(raw.quotationId),
     quotationId: raw.quotationId,
     number: raw.quotationNumber,
     quotationNumber: raw.quotationNumber,
-    clientId: "", // Not provided in the list API directly, but we have clientName
+    clientId: (raw as any).clientId ? String((raw as any).clientId) : "",
     clientName: raw.clientName,
     date: raw.quotationDate,
     validUntil: new Date(new Date(raw.quotationDate).getTime() + raw.validityDays * 24 * 60 * 60 * 1000).toISOString(),
@@ -96,9 +141,9 @@ export function mapApiQuotation(raw: ApiQuotation): Quotation {
     items,
     subtotal,
     taxAmount,
-    totalAmount: subtotal + taxAmount,
-    billingAddress: raw.clientAddress,
-    shippingAddress: raw.clientAddress,
+    totalAmount,
+    billingAddress: (raw as any).billingAddress ?? raw.clientAddress ?? "",
+    shippingAddress: (raw as any).shippingAddress ?? (raw as any).billingAddress ?? raw.clientAddress ?? "",
     notes: raw.subject,
     subject: raw.subject,
     clientMobileNo: raw.clientMobileNo,
@@ -107,6 +152,12 @@ export function mapApiQuotation(raw: ApiQuotation): Quotation {
     salesPersonName: raw.salesPersonName,
     salesPersonCell: raw.salesPersonCell,
     salesPersonId: (raw as any).salesPersonId ? String((raw as any).salesPersonId) : "",
-    gstinNo: raw.gstinNo
+    gstinNo: raw.gstinNo,
+    paymentType: (raw as any).paymentType || "Domestic",
+    currencyType: (raw as any).currencyType || "INR",
+    doctorSpeciality: Array.isArray((raw as any).doctorSpeciality)
+      ? (raw as any).doctorSpeciality.join(", ")
+      : ((raw as any).doctorSpeciality || ""),
+    doctorName: (raw as any).doctorName || "",
   }
 }

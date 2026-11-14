@@ -1,30 +1,41 @@
 "use client"
 
 import * as React from "react"
-import { useRouter } from "next/navigation"
-import { 
-  ArrowLeft, 
-  Printer, 
-  FileDown, 
-  Edit, 
-  Receipt, 
-  CheckCircle2, 
-  Circle, 
-  Clock, 
+import { useNavigate } from "react-router-dom"
+import {
+  ArrowLeft,
+  Printer,
+  FileDown,
+  Edit,
+  Receipt,
+  CheckCircle2,
+  Circle,
+  Clock,
   ShoppingCart,
   Calculator,
-  RefreshCw
+  RefreshCw,
+  Mail
 } from "lucide-react"
 import { SalesDocumentStatus } from "@/app/sales/types"
 import { ProformaInvoice } from "@/app/sales/proforma-invoices/types"
+import { getGoogleDrivePreviewUrl } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { ProformaFormDialog } from "../proforma-form-dialog"
-import { proformaApi } from "@/lib/api"
+import { getAllowedNextStatuses } from "../page"
+import { proformaApi, quotationsApi, clientsApi, productsApi, salesOrderApi } from "@/lib/api"
+import { PrintLayout, executePrint, DEFAULT_TEJCO_COMPANY } from "@/components/common/print"
 import { toast } from "sonner"
 
 interface ProformaDetailsViewProps {
@@ -38,77 +49,456 @@ const COMPANY = {
   bankDetails: [
     "INR BANK DETAILS",
     "Name of the Company: TEJCO GLOBAL LLP",
-    "Branch Name : Bandra (West), Mumbai – 400 050.",
+    "Branch Name : Bandra (West), Mumbai \u2013 400 050.",
     "Bank Account No : 012800000002727",
     "Type of Account : Current Account",
     "IFSC Code : IOBA0000128",
   ],
 }
 
+const getCurrencySymbol = (currency?: string) => {
+  if (!currency) return "₹"
+  switch (currency.toUpperCase()) {
+    case "USD": return "$"
+    case "EUR": return "€"
+    case "GBP": return "£"
+    case "INR": return "₹"
+    default: return currency
+  }
+}
+
+const getPrintCurrencySymbol = (currency?: string) => {
+  if (!currency || currency.toUpperCase() === "INR") return "Rs"
+  return getCurrencySymbol(currency)
+}
+
+const formatDateWithDots = (dateStr: string) => {
+  try {
+    const d = new Date(dateStr)
+    const day = String(d.getDate()).padStart(2, '0')
+    const month = String(d.getMonth() + 1).padStart(2, '0')
+    const year = d.getFullYear()
+    return `${day}.${month}.${year}`
+  } catch (e) {
+    return dateStr
+  }
+}
+
 export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetailsViewProps) {
-  const router = useRouter()
+  const navigate = useNavigate()
   const [proforma, setProforma] = React.useState<ProformaInvoice>(initialProforma)
   const [isDialogOpen, setIsDialogOpen] = React.useState(false)
   const [isConverting, setIsConverting] = React.useState(false)
+  const [linkedQuotationNumber, setLinkedQuotationNumber] = React.useState<string | null>(null)
+  const originalSubtotal = (proforma.items || []).reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0)
+  const totalDiscount = (proforma.items || []).reduce((sum, item) => sum + (((item as any).discountAmount || 0) * item.quantity), 0)
+  const hasDiscounts = totalDiscount > 0
+
+  // Fetch linked quotation number when sourceQuotationId is present
+  React.useEffect(() => {
+    const fetchLinkedQuotation = async () => {
+      if (!proforma.sourceQuotationId) return
+      try {
+        const q = await quotationsApi.getById(String(proforma.sourceQuotationId))
+        setLinkedQuotationNumber(q.number || `QT-${proforma.sourceQuotationId}`)
+      } catch {
+        setLinkedQuotationNumber(`QT-${proforma.sourceQuotationId}`)
+      }
+    }
+    fetchLinkedQuotation()
+  }, [proforma.sourceQuotationId])
+
+  const enrichProformaWithGst = async (targetProforma: ProformaInvoice): Promise<ProformaInvoice> => {
+    if (!targetProforma.items || targetProforma.items.length === 0) return targetProforma
+
+    try {
+      const updatedItems = await Promise.all(
+        targetProforma.items.map(async (item) => {
+          if (!item.productId) return item
+          try {
+            const prodRes = await productsApi.getById(item.productId)
+            const product = prodRes?.data || prodRes
+
+            let gstRate = item.gstRate
+            if (product) {
+              if (product.variants && Array.isArray(product.variants)) {
+                // Robust matching:
+                // 1. Try SKU matching
+                // 2. Try variantName matching against item.name
+                // 3. Fall back to the first variant
+                const variant = product.variants.find((v: any) => {
+                  const sku = `${product.baseSKU || ""}${v.skuSuffix || ""}`
+                  return sku.toLowerCase() === item.sku.toLowerCase() ||
+                    v.variantName?.toLowerCase() === item.name?.toLowerCase()
+                }) || product.variants[0]
+
+                if (variant) {
+                  gstRate = variant.gstPercentage ?? product.gstPercentage ?? gstRate
+                } else {
+                  gstRate = product.gstPercentage ?? gstRate
+                }
+              } else {
+                gstRate = product.gstPercentage ?? gstRate
+              }
+            }
+
+            const isForeign = targetProforma.paymentType === "Foreign"
+            const finalGst = isForeign ? 0 : (gstRate || 0)
+            const basePrice = finalGst > 0 ? (item.unitPrice || 0) / (1 + finalGst / 100) : (item.unitPrice || 0)
+
+            const discPct = item.discountPercentage || 0
+            let discAmt = item.discountAmount || 0
+            if (discAmt === 0 && discPct > 0) {
+              discAmt = parseFloat((basePrice * (discPct / 100)).toFixed(2))
+            }
+
+            const discountedBase = Math.max(0, basePrice - discAmt)
+            const finalUnitPrice = finalGst > 0 ? discountedBase * (1 + finalGst / 100) : discountedBase
+            const itemTotal = parseFloat((finalUnitPrice * item.quantity).toFixed(2))
+
+            return {
+              ...item,
+              gstRate: gstRate || 0,
+              discountAmount: discAmt,
+              discountedUnitPrice: finalUnitPrice,
+              total: itemTotal
+            }
+          } catch (err) {
+            console.error(`Failed to fetch GST rate for product ID ${item.productId}:`, err)
+            return item
+          }
+        })
+      )
+
+      const isForeign = targetProforma.paymentType === "Foreign"
+      const subtotal = updatedItems.reduce((acc, item) => {
+        const price = item.unitPrice || 0
+        const gstRate = isForeign ? 0 : (item.gstRate || 0)
+        const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+        const discAmt = (item as any).discountAmount || 0
+        const discountedBase = Math.max(0, basePrice - discAmt)
+        return acc + (discountedBase * item.quantity)
+      }, 0)
+
+      const taxAmount = isForeign ? 0 : updatedItems.reduce((acc, item) => {
+        const price = item.unitPrice || 0
+        const gstRate = item.gstRate || 0
+        const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+        const discAmt = (item as any).discountAmount || 0
+        const discountedBase = Math.max(0, basePrice - discAmt)
+        return acc + (discountedBase * (gstRate / 100) * item.quantity)
+      }, 0)
+
+      return {
+        ...targetProforma,
+        items: updatedItems,
+        subtotal,
+        taxAmount,
+        totalAmount: subtotal + taxAmount + (targetProforma.freight || 0)
+      }
+    } catch (err) {
+      console.error("Failed to update GST rates dynamically:", err)
+      return targetProforma
+    }
+  }
+
+  // Fetch correct GST rates on mount or when initialProforma items/settings change
+  React.useEffect(() => {
+    enrichProformaWithGst(initialProforma).then(setProforma)
+  }, [initialProforma.items, initialProforma.paymentType, initialProforma.freight])
+
+  const printRef = React.useRef<HTMLDivElement>(null)
+
+  const handlePrint = () => {
+    executePrint(printRef.current, {
+      documentTitle: `Proforma Invoice - ${proforma.number || proforma.proformaNumber}`,
+      pageOrientation: "portrait",
+    })
+  }
+
+  const [isSendingEmail, setIsSendingEmail] = React.useState(false)
+
+  const handleSendEmail = async () => {
+    try {
+      setIsSendingEmail(true)
+      await proformaApi.sendEmail(proforma.proformaId || proforma.id)
+      toast.success(`Email sent successfully for Proforma Invoice ${proforma.number || proforma.proformaNumber}`)
+    } catch (err: any) {
+      console.error("Failed to send email:", err)
+      toast.error(err?.message || "Failed to send email.")
+    } finally {
+      setIsSendingEmail(false)
+    }
+  }
 
   const handleConvertToOrder = async () => {
-    if (proforma.status === "Converted to Sales Order") return
+    if (proforma.status?.toLowerCase() === "converted to sales order" || proforma.status?.toLowerCase() === "converted to order") {
+      toast.info("This proforma invoice has already been converted to a Sales Order.")
+      return
+    }
     setIsConverting(true)
     try {
-      const payload = {
-        proformaInvoiceId: proforma.proformaId,
-        piNo: proforma.proformaNumber || "",
-        piDate: new Date(proforma.date || new Date()).toISOString(),
-        billingName: proforma.clientName || "",
-        billingAddress: proforma.billingAddress || "",
-        freight: proforma.freight || 0,
-        totalAmount: proforma.totalAmount || 0,
-        deliveryTerms: proforma.deliveryTerms || proforma.deliveryTime || "10-15 Working Days",
-        paymentTerms: proforma.paymentTerms || proforma.notes || "",
-        salesPersonName: proforma.salesPersonName || "",
-        salesPersonCell: proforma.salesPersonCell || "",
-        salesPersonId: proforma.salesPersonId ? String(proforma.salesPersonId) : "",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        status: "Converted to Sales Order",
-        items: (proforma.items || []).map(item => ({
-          proformaInvoiceItemId: isNaN(parseInt(item.id)) ? 0 : parseInt(item.id),
-          proformaInvoiceId: proforma.proformaId,
-          productId: isNaN(parseInt(item.productId)) ? 0 : parseInt(item.productId),
-          productName: item.productName || "",
-          imageUrl: (item as any).imageUrl || "",
-          quantity: item.quantity || 0,
-          rate: item.unitPrice || 0,
-          discountPercentage: (item as any).discountPercentage || 0,
-          discountAmount: (item as any).discountAmount || 0,
-          total: item.total || 0,
-        })),
+      // 1. Fetch full proforma details if items are missing or clientId is zero
+      let sourceProforma = proforma
+      let sourceItems = proforma.items || []
+      let resolvedClientId =
+        proforma.clientId && !isNaN(Number(proforma.clientId)) && Number(proforma.clientId) > 0
+          ? Number(proforma.clientId)
+          : 0
+      let resolvedClientName = proforma.clientName || (proforma as any).billingName || ""
+
+      if ((!sourceItems || sourceItems.length === 0 || !resolvedClientId) && (proforma.proformaId || proforma.id)) {
+        try {
+          const full = await proformaApi.getById(String(proforma.proformaId || proforma.id))
+          if (full) {
+            sourceProforma = full
+            if (full.items && full.items.length > 0) {
+              sourceItems = full.items
+            }
+            const rawCId =
+              full.clientId ||
+              (full as any)?.customerId ||
+              (full as any)?.customerMasterId ||
+              (full as any)?.clientMasterId
+            if (rawCId && !isNaN(Number(rawCId)) && Number(rawCId) > 0) {
+              resolvedClientId = Number(rawCId)
+            }
+            if (full.clientName && !resolvedClientName) {
+              resolvedClientName = full.clientName
+            }
+          }
+        } catch (e) {
+          console.error("Failed to fetch detailed proforma for client/items:", e)
+        }
       }
-      await proformaApi.update(String(proforma.proformaId), payload)
-      toast.success("Proforma marked as converted to Sales Order")
-      setProforma(prev => ({ ...prev, status: "Converted to Sales Order" }))
-    } catch (err) {
-      console.error("Failed to update proforma status:", err)
+
+      // 2. Resolve client ID if missing
+      const targetClientName = (resolvedClientName || sourceProforma.clientName || (sourceProforma as any).billingName || (proforma as any).billingName || "").trim()
+      if (!resolvedClientId && targetClientName) {
+        const searchTerms = [
+          targetClientName,
+          targetClientName.split(/[-–—(]/)[0].trim(),
+          targetClientName.split(/\s+/).slice(0, 3).join(" ").trim(),
+        ].filter(Boolean)
+
+        for (const term of searchTerms) {
+          if (resolvedClientId) break
+          if (!term || term.length < 2) continue
+          try {
+            const clientRes = await clientsApi.getAll({
+              search: term,
+              searchBy: "ClientName",
+              pageSize: 20,
+            })
+            const list = clientRes.clients || []
+            const lowerTarget = targetClientName.toLowerCase()
+            const match =
+              list.find(c => c.name?.trim().toLowerCase() === lowerTarget) ||
+              list.find(c => lowerTarget.includes(c.name?.trim().toLowerCase())) ||
+              list.find(c => c.name?.trim().toLowerCase().includes(term.toLowerCase())) ||
+              (list.length === 1 ? list[0] : null)
+
+            if (match && match.id && !isNaN(Number(match.id)) && Number(match.id) > 0) {
+              resolvedClientId = Number(match.id)
+              resolvedClientName = match.name || resolvedClientName
+              break
+            }
+          } catch (e) {
+            console.error("Failed to query clients API with searchBy=ClientName:", e)
+          }
+        }
+
+        if (!resolvedClientId) {
+          try {
+            const allClientsRes = await clientsApi.getAll({ pageSize: 100 })
+            const allList = allClientsRes.clients || []
+            const lowerTarget = targetClientName.toLowerCase()
+            const match =
+              allList.find(c => c.name?.trim().toLowerCase() === lowerTarget) ||
+              allList.find(c => lowerTarget.includes(c.name?.trim().toLowerCase())) ||
+              allList.find(c => c.name?.trim().toLowerCase().includes(lowerTarget))
+            if (match && match.id && !isNaN(Number(match.id)) && Number(match.id) > 0) {
+              resolvedClientId = Number(match.id)
+              resolvedClientName = match.name || resolvedClientName
+            }
+          } catch (e) {
+            console.error("Fallback all-clients lookup failed:", e)
+          }
+        }
+      }
+
+      // Check linked quotation if any
+      const quoteId = proforma.sourceQuotationId || sourceProforma.sourceQuotationId || (proforma as any).linkedQuotationId || (sourceProforma as any).linkedQuotationId
+      if (!resolvedClientId && quoteId) {
+        try {
+          const quote = await quotationsApi.getById(String(quoteId))
+          if (quote?.clientId && !isNaN(Number(quote.clientId)) && Number(quote.clientId) > 0) {
+            resolvedClientId = Number(quote.clientId)
+            if (quote.clientName) resolvedClientName = quote.clientName
+          }
+        } catch (e) {
+          console.error("Failed to fetch linked quotation client ID:", e)
+        }
+      }
+
+      // 3. Process line items and resolve variant information
+      const processedLineItems = await Promise.all(
+        (sourceItems || []).map(async (item) => {
+          const unitPrice = Number(item.unitPrice ?? (item as any).price ?? (item as any).rate ?? 0)
+          const qty = Number(item.quantity || 0)
+          const discPct = Number((item as any).discountPercentage || 0)
+          const discAmt = Number((item as any).discountAmount !== undefined ? (item as any).discountAmount : (unitPrice * discPct / 100))
+          const itemTotal = Number(item.total !== undefined ? item.total : (unitPrice - discAmt) * qty)
+
+          let rawVariantId = (item as any).variantId !== undefined ? (item as any).variantId : (item as any).variant_id
+          let parsedVariantId = rawVariantId !== null && rawVariantId !== undefined && !isNaN(Number(rawVariantId)) ? Number(rawVariantId) : 0
+          let variantName = (item as any).variantName || ""
+
+          if ((!parsedVariantId || parsedVariantId <= 0) && item.productId && !isNaN(Number(item.productId))) {
+            try {
+              const resp = await productsApi.getById(item.productId)
+              const prodData = resp?.data || resp
+              const variants = Array.isArray(prodData?.variants) ? prodData.variants : []
+              if (variants.length > 0) {
+                const match =
+                  variants.find((v: any) => v.variantName && item.name && v.variantName.toLowerCase().trim() === item.name.toLowerCase().trim()) ||
+                  variants.find((v: any) => v.skuSuffix && item.sku && item.sku.endsWith(v.skuSuffix)) ||
+                  (variants.length === 1 ? variants[0] : null)
+                if (match) {
+                  const resolvedVid = match.variantId ?? match.id
+                  if (resolvedVid && !isNaN(Number(resolvedVid)) && Number(resolvedVid) > 0) {
+                    parsedVariantId = Number(resolvedVid)
+                  }
+                  if (match.variantName) {
+                    variantName = match.variantName
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn(`Could not fetch product ${item.productId} for variant resolution:`, err)
+            }
+          }
+
+          const prodName = item.productName || item.name || ""
+          return {
+            orderItemId: 0,
+            orderId: 0,
+            productId: item.productId && !isNaN(Number(item.productId)) ? Number(item.productId) : 0,
+            productName: prodName,
+            variantId: parsedVariantId > 0 ? parsedVariantId : 0,
+            variantName: variantName || prodName,
+            sku: item.sku || (item as any).skuSuffix || prodName || "",
+            quantity: qty,
+            unitPrice: unitPrice,
+            discountPercentage: discPct,
+            discountAmount: discAmt,
+            totalPrice: itemTotal,
+          }
+        })
+      )
+
+      const year = new Date().getFullYear()
+      const random = Math.floor(1000 + Math.random() * 9000)
+      const linkedProformaIdNum = Number(proforma.proformaId || proforma.id) || 0
+      const quoteIdNum = Number(quoteId) || 0
+
+      const subtotalVal = Number(sourceProforma.subtotal ?? proforma.subtotal ?? 0)
+      const gstVal = Number(sourceProforma.taxAmount ?? (sourceProforma as any).gstAmount ?? proforma.taxAmount ?? 0)
+      const freightVal = Number((sourceProforma as any).freight ?? (proforma as any).freight ?? 0)
+      const totalVal = Number(sourceProforma.totalAmount ?? proforma.totalAmount ?? (subtotalVal + gstVal + freightVal))
+
+      const salesPersonIdNum = (proforma.salesPersonId && !isNaN(Number(proforma.salesPersonId)))
+        ? Number(proforma.salesPersonId)
+        : ((sourceProforma?.salesPersonId && !isNaN(Number(sourceProforma.salesPersonId))) ? Number(sourceProforma.salesPersonId) : 0)
+
+      // 4. Construct exact payload for POST /api/SalesOrder/Create
+      const orderPayload = {
+        orderId: 0,
+        orderNumber: `SO-${year}-${random}`,
+        orderDate: new Date().toISOString(),
+        targetDeliveryDate: proforma.validUntil || (sourceProforma as any).validUntil
+          ? new Date(proforma.validUntil || (sourceProforma as any).validUntil).toISOString()
+          : new Date().toISOString(),
+        clientId: resolvedClientId,
+        clientName: resolvedClientName || proforma.clientName || targetClientName,
+        orderStatus: "Pending",
+        paymentStatus: "Unpaid",
+        salesPersonId: salesPersonIdNum,
+        billingAddress: sourceProforma.billingAddress || (sourceProforma as any).clientAddress || proforma.billingAddress || (proforma as any).clientAddress || "",
+        status: "Pending",
+        shippingAddress: sourceProforma.shippingAddress || sourceProforma.billingAddress || (sourceProforma as any).clientAddress || proforma.shippingAddress || proforma.billingAddress || (proforma as any).clientAddress || "",
+        subtotal: subtotalVal,
+        gstAmount: gstVal,
+        freight: freightVal,
+        totalAmount: totalVal,
+        sourceLead: "Proforma Invoice",
+        paymentType: sourceProforma.paymentType || proforma.paymentType || "Domestic",
+        currencyType: sourceProforma.currencyType || proforma.currencyType || "INR",
+        orderNotes: sourceProforma.notes || (sourceProforma as any).paymentTerms || proforma.notes || (proforma as any).paymentTerms || proforma.subject || "",
+        linkedProformaInvoiceId: linkedProformaIdNum,
+        linkedQuotationId: quoteIdNum,
+        parentOrderId: 0,
+        doctorSpeciality: (() => {
+          const spec = (sourceProforma as any).doctorSpeciality || (proforma as any).doctorSpeciality
+          if (Array.isArray(spec)) return spec.map((s: any) => String(s).trim()).filter(Boolean)
+          if (typeof spec === "string" && spec.trim()) return spec.split(",").map((s: any) => s.trim()).filter(Boolean)
+          return []
+        })(),
+        doctorName: (sourceProforma as any).doctorName || (proforma as any).doctorName || resolvedClientName || proforma.clientName || "",
+        clientGSTIN: sourceProforma.gstinNo || (sourceProforma as any).clientGSTIN || proforma.gstinNo || (proforma as any).clientGSTIN || "",
+        lineItems: processedLineItems,
+      }
+
+      // 5. Call POST /api/SalesOrder/Create
+      await salesOrderApi.create(orderPayload)
+
+      // 6. Update proforma invoice status
+      try {
+        await proformaApi.updateStatus(linkedProformaIdNum, "Converted to Sales Order")
+      } catch (statusErr) {
+        console.warn("Failed to update proforma invoice status:", statusErr)
+      }
+
+      setProforma(prev => ({
+        ...prev,
+        clientId: resolvedClientId ? String(resolvedClientId) : prev.clientId,
+        clientName: resolvedClientName || prev.clientName,
+        status: "Converted to Sales Order",
+      }))
+
+      toast.success("Proforma Invoice converted to Sales Order successfully!")
+      navigate("/sales/orders")
+    } catch (err: any) {
+      console.error("Failed to convert proforma to sales order:", err)
+      toast.error(err?.message || "Failed to convert proforma to sales order.")
     } finally {
       setIsConverting(false)
     }
+  }
 
-    localStorage.setItem("convert_source_data", JSON.stringify({
-      ...proforma,
-      sourceId: proforma.id,
-      number: "",
-      status: "Pending",
-      paymentStatus: "Unpaid",
-      date: new Date().toISOString().split("T")[0],
-    }))
-    router.push("/sales/orders?convert=true")
+  const [isUpdatingStatus, setIsUpdatingStatus] = React.useState(false)
+
+  const handleStatusChange = async (newStatus: string | null) => {
+    if (!newStatus || proforma.status?.toLowerCase() === newStatus.toLowerCase()) return
+    setIsUpdatingStatus(true)
+    try {
+      await proformaApi.updateStatus(proforma.proformaId || proforma.id, newStatus)
+      setProforma((prev) => ({ ...prev, status: newStatus as SalesDocumentStatus }))
+      toast.success(`Status updated to "${newStatus}" successfully.`)
+    } catch (err: any) {
+      console.error("Failed to update status:", err)
+      toast.error(err?.message || "Failed to update proforma status.")
+    } finally {
+      setIsUpdatingStatus(false)
+    }
   }
 
   const handleSave = async () => {
     try {
       const updated = await proformaApi.getById(String(initialProforma.proformaId))
-      setProforma(updated)
-      router.refresh()
+      const enriched = await enrichProformaWithGst(updated)
+      setProforma(enriched)
+      navigate(0)
     } catch (err) {
       console.error("Failed to refresh proforma after edit:", err)
     }
@@ -133,43 +523,89 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
     return lines.map((line, idx) => <div key={idx}>{line}</div>)
   }
 
-  const getStatusIcon = (status: SalesDocumentStatus) => {
-    switch (status) {
-      case "Draft": return <Clock className="h-5 w-5 text-slate-400" />
-      case "Issued": return <Receipt className="h-5 w-5 text-primary" />
-      case "Converted to Sales Order": return <ShoppingCart className="h-5 w-5 text-emerald-500" />
-      case "Cancelled": return <Circle className="h-5 w-5 text-destructive" />
+  const getStatusIcon = (status: SalesDocumentStatus | string) => {
+    const norm = String(status || "").toLowerCase().trim()
+    switch (norm) {
+      case "draft": return <Clock className="h-5 w-5 text-slate-400" />
+      case "sent to client": return <Mail className="h-5 w-5 text-sky-500" />
+      case "accepted": return <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+      case "rejected": return <Circle className="h-5 w-5 text-rose-500" />
+      case "converted to pi":
+      case "converted to proforma": return <Receipt className="h-5 w-5 text-purple-500" />
+      case "converted to sales order": return <ShoppingCart className="h-5 w-5 text-emerald-500" />
+      case "cancelled": return <Circle className="h-5 w-5 text-destructive" />
+      case "issued": return <Receipt className="h-5 w-5 text-primary" />
       default: return <Circle className="h-5 w-5" />
     }
   }
 
-  const getStatusBadge = (status: SalesDocumentStatus) => {
-    switch (status) {
-      case "Draft": return <Badge variant="secondary" className="bg-slate-100 text-slate-700 border-none">Draft Mode</Badge>
-      case "Issued": return <Badge variant="secondary" className="bg-primary/10 text-primary border-none">Issued &amp; Pending</Badge>
-      case "Converted to Sales Order": return <Badge variant="secondary" className="bg-emerald-100 text-emerald-800 border-none">Converted to Order</Badge>
-      case "Cancelled": return <Badge variant="destructive">Cancelled</Badge>
-      default: return <Badge variant="outline">{status}</Badge>
+  const getStatusBadge = (status: SalesDocumentStatus | string) => {
+    const norm = String(status || "").toLowerCase().trim()
+    if (norm === "draft") {
+      return <Badge variant="secondary" className="bg-slate-100 text-slate-700 border-none">Draft Mode</Badge>
     }
+    if (norm === "sent to client") {
+      return <Badge variant="secondary" className="bg-sky-100 text-sky-800 border-none">Sent to Client</Badge>
+    }
+    if (norm === "accepted") {
+      return <Badge variant="secondary" className="bg-emerald-100 text-emerald-800 border-none">Accepted</Badge>
+    }
+    if (norm === "rejected") {
+      return <Badge variant="secondary" className="bg-rose-100 text-rose-800 border-none">Rejected</Badge>
+    }
+    if (norm === "converted to pi" || norm === "converted to proforma") {
+      return <Badge variant="secondary" className="bg-purple-100 text-purple-800 border-none">Converted to PI</Badge>
+    }
+    if (norm === "converted to sales order" || norm === "converted to order") {
+      return <Badge variant="secondary" className="bg-emerald-100 text-emerald-800 border-none">Converted to Order</Badge>
+    }
+    if (norm === "cancelled") {
+      return <Badge variant="destructive">Cancelled</Badge>
+    }
+    if (norm === "issued") {
+      return <Badge variant="secondary" className="bg-primary/10 text-primary border-none">Issued & Pending</Badge>
+    }
+    return <Badge variant="outline">{status}</Badge>
   }
 
   return (
     <>
-      {/* ═══════════════════════════════════════════════════════════
-          SCREEN VIEW — Normal dashboard card layout
+      {/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+          SCREEN VIEW â€” Normal dashboard card layout
           Hidden during print via CSS: .screen-only { display: none }
-      ═══════════════════════════════════════════════════════════ */}
+      â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â•  */}
       <div className="screen-only flex flex-col gap-6">
         {/* Header Actions */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <Button variant="outline" size="icon" onClick={() => router.back()} className="rounded-full h-10 w-10 border-slate-200">
+            <Button variant="ghost" size="sm" onClick={() => navigate(-1)} className="gap-2 text-slate-600 hover:text-slate-900">
               <ArrowLeft className="h-4 w-4" />
             </Button>
             <div>
               <div className="flex items-center gap-3">
                 <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">{proforma.number}</h1>
                 {getStatusBadge(proforma.status)}
+                <div className="w-[190px]">
+                  <Select
+                    value={proforma.status || "Draft"}
+                    onValueChange={handleStatusChange}
+                    disabled={isUpdatingStatus || getAllowedNextStatuses(proforma.status).length === 0}
+                  >
+                    <SelectTrigger className="h-8 text-xs bg-white border-slate-200">
+                      <SelectValue placeholder="Change status" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={proforma.status || "Draft"}>
+                        {proforma.status || "Draft"} (Current)
+                      </SelectItem>
+                      {getAllowedNextStatuses(proforma.status).map((st) => (
+                        <SelectItem key={st} value={st}>
+                          {st}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
               <div className="text-sm font-medium text-slate-500 mt-1 flex items-center gap-2">
                 <Clock className="h-3.5 w-3.5" />
@@ -180,12 +616,32 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="outline" className="gap-2 border-slate-200 shadow-sm" onClick={() => window.print()}>
+            <Button
+              variant="outline"
+              className="gap-2 border-slate-200 shadow-sm"
+              onClick={handleSendEmail}
+              disabled={isSendingEmail}
+            >
+              {isSendingEmail ? (
+                <>
+                  <RefreshCw className="h-4 w-4 animate-spin text-slate-600" /> Sending Email...
+                </>
+              ) : (
+                <>
+                  <Mail className="h-4 w-4 text-slate-600" /> Send Email
+                </>
+              )}
+            </Button>
+            <Button
+              variant="outline"
+              className="gap-2 border-slate-200 shadow-sm"
+              onClick={handlePrint}
+            >
               <Printer className="h-4 w-4 text-slate-600" /> Print PI
             </Button>
-            <Button variant="outline" className="gap-2 border-slate-200 shadow-sm">
+            {/* <Button variant="outline" className="gap-2 border-slate-200 shadow-sm">
               <FileDown className="h-4 w-4 text-slate-600" /> Download
-            </Button>
+            </Button> */}
             <Button className="gap-2 bg-primary hover:bg-primary/90 shadow-md" onClick={() => setIsDialogOpen(true)}>
               <Edit className="h-4 w-4" /> Edit Details
             </Button>
@@ -214,6 +670,7 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
                       <TableHead className="font-bold text-slate-700">SKU</TableHead>
                       <TableHead className="text-center font-bold text-slate-700">Qty</TableHead>
                       <TableHead className="text-right font-bold text-slate-700">Rate</TableHead>
+                      <TableHead className="text-right font-bold text-slate-700">Disc Amt</TableHead>
                       <TableHead className="text-center font-bold text-slate-700">GST</TableHead>
                       <TableHead className="text-right pr-6 font-bold text-slate-700">Amount</TableHead>
                     </TableRow>
@@ -224,7 +681,7 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
                         <TableCell className="pl-6">
                           <div className="flex items-center gap-3">
                             {item.imageUrl && (
-                              <img src={item.imageUrl} alt={item.productName} className="w-8 h-8 rounded object-cover border border-slate-100" />
+                              <img src={getGoogleDrivePreviewUrl(item.imageUrl) || ""} alt={item.productName} className="w-8 h-8 rounded object-cover border border-slate-100" referrerPolicy="no-referrer" />
                             )}
                             <div>
                               <div className="font-bold text-slate-800">{item.productName}</div>
@@ -234,15 +691,17 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
                         <TableCell className="text-xs font-mono text-slate-400">{item.sku}</TableCell>
                         <TableCell className="text-center font-medium">{item.quantity}</TableCell>
                         <TableCell className="text-right">
-                          <div className="font-medium">₹{item.unitPrice.toLocaleString()}</div>
-                          {item.discountPercentage !== undefined && item.discountPercentage > 0 && (
-                            <div className="text-[10px] text-red-500 font-bold mt-0.5">
-                              -{item.discountPercentage}% (-₹{(item.discountAmount || 0).toLocaleString()})
-                            </div>
-                          )}
+                          <div className="font-medium">{getCurrencySymbol(proforma.currencyType)}{item.unitPrice.toLocaleString()}</div>
+                        </TableCell>
+                        <TableCell className="text-right text-slate-500">
+                          {item.discountAmount && item.discountAmount > 0 ? (
+                            <span className="text-rose-600 font-medium">
+                              -{getCurrencySymbol(proforma.currencyType)}{(item.discountAmount * item.quantity).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </span>
+                          ) : "\u2014"}
                         </TableCell>
                         <TableCell className="text-center font-bold text-slate-500 bg-slate-50/50">{item.gstRate}%</TableCell>
-                        <TableCell className="text-right pr-6 font-extrabold text-slate-900">₹{item.total.toLocaleString()}</TableCell>
+                        <TableCell className="text-right pr-6 font-extrabold text-slate-900">{getCurrencySymbol(proforma.currencyType)}{item.total?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? ((item.unitPrice * item.quantity).toLocaleString())}</TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
@@ -250,26 +709,71 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
 
                 <div className="p-8 flex justify-end bg-slate-50/20 border-t border-slate-50 font-sans">
                   <div className="w-96 space-y-4">
-                    <div className="flex justify-between text-sm items-center">
-                      <span className="text-slate-500 font-medium">Net Value (Subtotal)</span>
-                      <span className="font-bold text-slate-800 text-lg">₹{proforma.subtotal.toLocaleString()}</span>
-                    </div>
-                    <div className="flex justify-between text-sm items-center">
-                      <span className="text-slate-500 font-medium">Combined GST Amount</span>
-                      <span className="text-emerald-600 font-extrabold text-lg">+ ₹{proforma.taxAmount.toLocaleString()}</span>
-                    </div>
-                    {proforma.freight !== undefined && (
+                    {proforma.paymentType === "Foreign" ? (
+                      <>
+                        <div className="flex justify-between text-sm items-center">
+                          <span className="text-slate-500 font-medium">Gross Total</span>
+                          <span className="font-bold text-slate-800 text-lg">{getCurrencySymbol(proforma.currencyType)}{originalSubtotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                        </div>
+                        {hasDiscounts && (
+                          <div className="flex justify-between text-sm items-center">
+                            <span className="text-slate-500 font-medium">Total Discount</span>
+                            <span className="text-rose-600 font-bold text-lg">- {getCurrencySymbol(proforma.currencyType)}{totalDiscount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        {/* 1. Base Amount (Price minus GST) */}
+                        <div className="flex justify-between text-sm items-center">
+                          <span className="text-slate-500 font-medium">Gross Base Value (Excl. GST)</span>
+                          <span className="font-bold text-slate-800 text-lg">
+                            {getCurrencySymbol(proforma.currencyType)}
+                            {proforma.items?.reduce((sum, item) => {
+                              const price = item.unitPrice || 0
+                              const gstRate = item.gstRate || 0
+                              const base = gstRate > 0 ? price / (1 + gstRate / 100) : price
+                              return sum + (base * item.quantity)
+                            }, 0)?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          </span>
+                        </div>
+
+                        {/* 2. Total Discount applied on Base Amount */}
+                        {hasDiscounts && (
+                          <div className="flex justify-between text-sm items-center">
+                            <span className="text-slate-500 font-medium">Total Discount (On Base Value)</span>
+                            <span className="text-rose-600 font-bold text-lg">- {getCurrencySymbol(proforma.currencyType)}{totalDiscount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                          </div>
+                        )}
+
+                        {/* 3. Taxable Subtotal after Discount */}
+                        <div className="flex justify-between text-sm items-center">
+                          <span className="text-slate-500 font-medium">Taxable Subtotal</span>
+                          <span className="font-bold text-slate-800 text-lg">{getCurrencySymbol(proforma.currencyType)}{proforma.subtotal?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                        </div>
+
+                        {/* 4. GST on Discounted Subtotal */}
+                        <div className="flex justify-between text-sm items-center">
+                          <span className="text-slate-500 font-medium">Total GST</span>
+                          <span className="text-emerald-600 font-extrabold text-lg">{getCurrencySymbol(proforma.currencyType)}{proforma.taxAmount?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                        </div>
+                      </>
+                    )}
+
+                    {proforma.freight !== undefined && proforma.freight > 0 && (
                       <div className="flex justify-between text-sm items-center">
                         <span className="text-slate-500 font-medium">Freight Charges</span>
-                        <span className="font-bold text-slate-800 text-lg">+ ₹{proforma.freight.toLocaleString()}</span>
+                        <span className="font-bold text-slate-800 text-lg">+ {getCurrencySymbol(proforma.currencyType)}{proforma.freight.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                       </div>
                     )}
                     <Separator className="bg-slate-200" />
                     <div className="flex justify-between items-baseline pt-2">
                       <span className="text-slate-900 font-extrabold text-lg">Total Payable</span>
                       <div className="text-right">
-                        <span className="text-slate-900 text-4xl font-black tracking-tighter">₹{proforma.totalAmount.toLocaleString()}</span>
-                        <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Inclusive of all taxes</p>
+                        <span className="text-slate-900 text-4xl font-black tracking-tighter">{getCurrencySymbol(proforma.currencyType)}{proforma.totalAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                        {proforma.paymentType !== "Foreign" && (
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Inclusive of all taxes</p>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -295,7 +799,6 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
             </Card>
           </div>
 
-          {/* Sidebar */}
           <div className="col-span-4 space-y-6">
             <Card className="shadow-md border-slate-200 overflow-hidden">
               <CardHeader className="bg-primary/5 border-b border-primary/10">
@@ -319,8 +822,8 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
 
                 <div className="space-y-2">
                   <Label className="text-[10px] font-black uppercase text-slate-400 tracking-widest block mb-3">Post-Issuance Actions</Label>
-                  {proforma.status !== "Converted to Sales Order" && (
-                    <Button 
+                  {proforma.status?.toLowerCase() !== "converted to sales order" && (
+                    <Button
                       className="w-full bg-emerald-600 hover:bg-emerald-700 font-bold gap-2 shadow-lg shadow-emerald-100"
                       onClick={handleConvertToOrder}
                       disabled={isConverting}
@@ -388,16 +891,31 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
                   <div className="flex flex-col">
                     <Label className="text-[10px] font-black uppercase text-slate-400 tracking-widest mb-1.5">Shipping Destination</Label>
                     <div className="p-3 bg-slate-50/50 rounded-xl border border-slate-100 text-[11px] font-bold text-slate-700 leading-relaxed italic">
-                      {renderAddressLines(proforma.shippingAddress)}
+                      {renderAddressLines(proforma.shippingAddress || "")}
                     </div>
                   </div>
                   <div className="flex flex-col">
                     <Label className="text-[10px] font-black uppercase text-slate-400 tracking-widest mb-1.5">Billing Address</Label>
                     <div className="p-3 bg-slate-50/50 rounded-xl border border-slate-100 text-[11px] font-bold text-slate-700 leading-relaxed italic">
-                      {renderAddressLines(proforma.billingAddress)}
+                      {renderAddressLines(proforma.billingAddress || "")}
                     </div>
                   </div>
                 </div>
+
+                {linkedQuotationNumber && (
+                  <>
+                    <Separator className="bg-slate-50" />
+                    <div className="flex flex-col">
+                      <span className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Linked Quotation</span>
+                      <button
+                        onClick={() => navigate(`/sales/quotations/${proforma.sourceQuotationId}`)}
+                        className="text-sm font-bold text-primary hover:underline mt-1 text-left"
+                      >
+                        {linkedQuotationNumber}
+                      </button>
+                    </div>
+                  </>
+                )}
               </CardContent>
             </Card>
 
@@ -433,195 +951,331 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
         </div>
       </div>
 
-      {/* ═══════════════════════════════════════════════════════════
-          PRINT-ONLY VIEW — Formal invoice document layout
-          Hidden on screen, shown only during @media print
-      ═══════════════════════════════════════════════════════════ */}
-      <div className="print-only" style={{ fontFamily: "Arial, sans-serif", fontSize: "12px" }}>
-
-        {/* Header */}
-        <div style={{ display: "flex", borderBottom: "4px solid #374151" }}>
-          {/* Logo area */}
-          <div style={{ padding: "16px 24px", background: "#fff", minWidth: 160, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <svg viewBox="0 0 80 80" style={{ width: 80, height: 80 }}>
-              <ellipse cx="20" cy="20" rx="18" ry="18" fill="#CC2229" />
-              <rect x="0" y="28" width="80" height="12" fill="#4A4A4A" />
-              <text x="6" y="60" fontSize="11" fontWeight="bold" fill="#1a1a1a" fontFamily="Arial">TEJCO</text>
-              <text x="6" y="72" fontSize="5.5" fill="#4A4A4A" fontFamily="Arial">Skin • Hair • Optics</text>
-            </svg>
-          </div>
-          {/* Red stripe */}
-          <div style={{ width: 8, background: "#DC2626", flexShrink: 0 }} />
-          {/* Company name */}
-          <div style={{ flex: 1, background: "#4B5563", display: "flex", alignItems: "center", justifyContent: "center", padding: "16px 24px" }}>
-            <span style={{ color: "#fff", fontSize: 22, fontWeight: "bold", letterSpacing: 4, textTransform: "uppercase" }}>
-              {COMPANY.name}
-            </span>
-          </div>
-        </div>
-
-        {/* Invoice Title */}
-        <div style={{ borderBottom: "1px solid #D1D5DB" }}>
-          <div style={{ textAlign: "center", padding: "6px", fontWeight: "bold", fontSize: 13, background: "#F9FAFB", borderBottom: "1px solid #D1D5DB" }}>
-            PROFORMA INVOICE
-          </div>
-          <div style={{ textAlign: "center", padding: "4px", fontSize: 11, color: "#374151" }}>
-            GST NO :- {COMPANY.gst}
-          </div>
-        </div>
-
-        {/* PI No / Date */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #D1D5DB" }}>
-          <div style={{ padding: "8px 12px", borderRight: "1px solid #D1D5DB", display: "flex", gap: 8, alignItems: "center" }}>
-            <strong>P.I No</strong>
-            <span style={{ marginLeft: 8 }}>{proforma.number}</span>
-          </div>
-          <div style={{ padding: "8px 12px", display: "flex", gap: 8, alignItems: "center" }}>
-            <strong>DATE</strong>
-            <span style={{ marginLeft: 8 }}>
-              {new Date(proforma.date).toLocaleDateString("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" })}
-            </span>
-          </div>
-        </div>
-
-        {/* Billing Name & Address */}
-        <div style={{ borderBottom: "1px solid #D1D5DB" }}>
-          <div style={{ padding: "6px 12px", background: "#F9FAFB", borderBottom: "1px solid #E5E7EB" }}>
-            <strong>Billing Name &amp; Address</strong>
-          </div>
-          <div style={{ padding: "10px 16px", minHeight: 80, lineHeight: 1.6, fontSize: 12 }}>
-            <div style={{ fontWeight: "bold", fontSize: 13, marginBottom: 4 }}>{proforma.clientName}</div>
-            {renderAddressLinesPrint(proforma.billingAddress)}
-            {proforma.gstinNo && <div style={{ marginTop: 4, fontWeight: 600 }}>GSTIN: {proforma.gstinNo}</div>}
-          </div>
-        </div>
-
-        {/* Items Table */}
-        <div style={{ borderBottom: "1px solid #D1D5DB" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
-            <thead>
-              <tr style={{ background: "#F9FAFB" }}>
-                <th style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "left", width: "35%" }}>Products</th>
-                <th style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "center", width: "20%" }}>Images</th>
-                <th style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "center", width: "10%" }}>Qty</th>
-                <th style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "center", width: "17.5%" }}>Rate in Rs/<br />Doller</th>
-                <th style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "center", width: "17.5%" }}>Total in Rs/<br />Doller</th>
-              </tr>
-            </thead>
-            <tbody>
-              {proforma.items.map((item) => (
-                <tr key={item.id}>
-                  <td style={{ border: "1px solid #D1D5DB", padding: "10px", verticalAlign: "top" }}>
-                    <div style={{ fontWeight: 600 }}>{item.productName}</div>
-                    {item.discountPercentage !== undefined && item.discountPercentage > 0 && (
-                      <div style={{ fontSize: 10, color: "#DC2626", marginTop: 2 }}>
-                        Discount: {item.discountPercentage}%
-                        {item.discountAmount !== undefined && ` (₹${item.discountAmount.toLocaleString()})`}
+      {/* ── Hidden Print Area using Common PrintLayout ── */}
+      <div id="proforma-print-area" className="hidden">
+        <PrintLayout
+          containerRef={printRef}
+          documentTitle="PROFORMA INVOICE"
+          documentSubtitle={`REF: ${proforma.number || proforma.proformaNumber}`}
+          footerProps={{
+            documentNumber: proforma.number || proforma.proformaNumber,
+            showBankDetails: true,
+            showComputerGeneratedDisclaimer: true,
+            authorizedSignatoryLabel: `FOR ${COMPANY.name}`,
+            customSignatures: (
+              <div className="pt-3 border-t border-slate-300 mt-4 text-xs font-sans">
+                <div className="grid grid-cols-2 gap-6 items-end">
+                  <div>
+                    <div className="text-[11px] text-slate-500 mb-1">
+                      P.O. SHOULD BE IN THE NAME OF <strong>{COMPANY.name}</strong>
+                    </div>
+                    <div className="font-bold text-xs text-slate-900">{COMPANY.forLine}</div>
+                    {proforma.salesPersonName && (
+                      <div className="mt-1">
+                        <div className="text-xs font-semibold text-slate-800">
+                          {proforma.salesPersonName}
+                        </div>
+                        {proforma.salesPersonCell && (
+                          <div className="text-[11px] text-slate-600">
+                            Cell: {proforma.salesPersonCell}
+                          </div>
+                        )}
                       </div>
                     )}
-                  </td>
-                  <td style={{ border: "1px solid #D1D5DB", padding: "10px", textAlign: "center", verticalAlign: "middle" }}>
-                    {item.imageUrl
-                      ? <img src={item.imageUrl} alt={item.productName} style={{ width: 48, height: 48, objectFit: "cover", margin: "0 auto", border: "1px solid #E5E7EB" }} />
-                      : <span style={{ color: "#CBD5E1", fontSize: 10 }}>—</span>
-                    }
-                  </td>
-                  <td style={{ border: "1px solid #D1D5DB", padding: "10px", textAlign: "center", verticalAlign: "middle" }}>{item.quantity}</td>
-                  <td style={{ border: "1px solid #D1D5DB", padding: "10px", textAlign: "right", verticalAlign: "middle" }}>₹{item.unitPrice.toLocaleString()}</td>
-                  <td style={{ border: "1px solid #D1D5DB", padding: "10px", textAlign: "right", verticalAlign: "middle", fontWeight: "bold" }}>₹{item.total.toLocaleString()}</td>
-                </tr>
-              ))}
-
-              {/* Filler rows */}
-              {proforma.items.length < 3 && Array.from({ length: 3 - proforma.items.length }).map((_, idx) => (
-                <tr key={`empty-${idx}`}>
-                  {[0, 1, 2, 3, 4].map((c) => (
-                    <td key={c} style={{ border: "1px solid #D1D5DB", padding: "14px 10px" }}>&nbsp;</td>
-                  ))}
-                </tr>
-              ))}
-
-              {/* Freight */}
-              <tr style={{ background: "#F9FAFB" }}>
-                <td colSpan={4} style={{ border: "1px solid #D1D5DB", padding: "8px 10px", fontWeight: "bold" }}>FREIGHT</td>
-                <td style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "right", fontWeight: "bold" }}>
-                  {proforma.freight !== undefined && proforma.freight > 0 ? `₹${proforma.freight.toLocaleString()}` : "-"}
-                </td>
-              </tr>
-
-              {/* Total */}
-              <tr style={{ background: "#F3F4F6" }}>
-                <td colSpan={4} style={{ border: "1px solid #D1D5DB", padding: "8px 10px", fontWeight: "bold", fontSize: 12 }}>TOTAL</td>
-                <td style={{ border: "1px solid #D1D5DB", padding: "8px 10px", textAlign: "right", fontWeight: "bold", fontSize: 13 }}>
-                  ₹{proforma.totalAmount.toLocaleString()}
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        {/* Payment Terms */}
-        <div style={{ borderBottom: "1px solid #D1D5DB", padding: "6px 12px" }}>
-          <strong>Payment Terms: </strong>
-          <span>{proforma.paymentTerms || proforma.notes || "100% Advance"}</span>
-        </div>
-
-        {/* Delivery Terms */}
-        <div style={{ borderBottom: "1px solid #D1D5DB", padding: "6px 12px" }}>
-          <strong>DELIVERY TERMS :- </strong>
-          <span>{proforma.deliveryTerms || proforma.deliveryTime || "Immediate Delivery"}</span>
-        </div>
-
-        {/* Footer: Sales Rep + Bank */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderBottom: "1px solid #D1D5DB", minHeight: 120 }}>
-          {/* Left: Sales Rep */}
-          <div style={{ borderRight: "1px solid #D1D5DB", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 8 }}>
-            <div style={{ fontWeight: "bold" }}>{COMPANY.forLine}</div>
-            {proforma.salesPersonName && (
-              <div style={{ marginTop: 4 }}>
-                <div style={{ fontWeight: 600 }}>
-                  {proforma.salesPersonName}
-                  {proforma.salesPersonCell && `: +91 ${proforma.salesPersonCell}`}
+                  </div>
+                  <div className="text-right">
+                    <div className="h-10 border-b border-slate-300 w-48 ml-auto mb-1" />
+                    <span className="text-[10px] text-slate-500 font-medium">Authorized Signature</span>
+                  </div>
                 </div>
-                {proforma.salesPersonCell && (
-                  <div style={{ color: "#2563EB", fontSize: 11, marginTop: 2 }}>{proforma.salesPersonCell}</div>
+              </div>
+            ),
+          }}
+        >
+          {/* Customer & Document Information Box */}
+          <div className="mb-4 text-xs font-sans border border-slate-300 rounded-md overflow-hidden">
+            <div className="grid grid-cols-2 divide-x divide-slate-300 bg-white">
+              {/* Left Column: Customer Details */}
+              <div className="p-3 space-y-1">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                  Billing Name &amp; Address:
+                </div>
+                <div className="font-bold text-sm text-slate-900">{proforma.clientName}</div>
+                {Boolean(proforma.doctorSpeciality) && (
+                  <div className="text-xs text-slate-600 font-medium">
+                    {Array.isArray(proforma.doctorSpeciality) ? proforma.doctorSpeciality.join(", ") : proforma.doctorSpeciality}
+                  </div>
+                )}
+                {proforma.billingAddress && (
+                  <div className="text-xs text-slate-600 whitespace-pre-wrap leading-relaxed">
+                    {proforma.billingAddress.replace(/\|/g, ", ")}
+                  </div>
+                )}
+                {proforma.clientMobileNo && (
+                  <div className="text-xs text-slate-700 pt-0.5">
+                    <span className="font-semibold text-slate-800">Mob:</span> {proforma.clientMobileNo}
+                  </div>
+                )}
+                <div className="text-xs text-slate-800 pt-1">
+                  <span className="font-bold text-slate-900">Client GSTIN / UIN:</span>{" "}
+                  <span className="font-mono font-bold text-slate-950 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">
+                    {proforma.gstinNo?.trim() ? proforma.gstinNo : "URP / Unregistered"}
+                  </span>
+                </div>
+              </div>
+
+              {/* Right Column: Proforma Metadata */}
+              <div className="p-3 space-y-1.5 bg-slate-50/60">
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-slate-600 font-medium">P.I No:</span>
+                  <span className="font-mono font-bold text-slate-900">
+                    {proforma.number || proforma.proformaNumber}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-xs">
+                  <span className="text-slate-600 font-medium">Date:</span>
+                  <span className="font-bold text-slate-900">{formatDateWithDots(proforma.date)}</span>
+                </div>
+                {linkedQuotationNumber && (
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-slate-600 font-medium">Linked Quote:</span>
+                    <span className="font-mono font-semibold text-slate-800">{linkedQuotationNumber}</span>
+                  </div>
+                )}
+                {proforma.deliveryTerms && (
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-slate-600 font-medium">Delivery:</span>
+                    <span className="font-semibold text-slate-900">{proforma.deliveryTerms}</span>
+                  </div>
+                )}
+                {proforma.salesPersonName && (
+                  <div className="flex justify-between items-center text-xs pt-1 border-t border-slate-200">
+                    <span className="text-slate-600 font-medium">Sales Rep:</span>
+                    <span className="font-semibold text-slate-900">{proforma.salesPersonName}</span>
+                  </div>
                 )}
               </div>
-            )}
-            <div style={{ marginTop: "auto", color: "#2563EB", textDecoration: "underline", fontSize: 11 }}>
-              AUTHORISED SIGNATORY
             </div>
           </div>
 
-          {/* Right: Bank Details */}
-          <div style={{ padding: "14px 16px" }}>
-            <div style={{ color: "#2563EB", textDecoration: "underline", fontSize: 11, marginBottom: 6 }}>Bank Details</div>
-            {COMPANY.bankDetails.map((line, idx) => (
-              <div key={idx} style={{ fontSize: 11, lineHeight: 1.6, color: "#374151" }}>{line}</div>
-            ))}
-          </div>
-        </div>
+          {/* Subject / Title Banner if exists */}
+          {proforma.subject && (
+            <div className="text-center font-semibold text-xs py-1.5 px-3 bg-slate-50 border border-slate-200 rounded-md mb-3 text-slate-800">
+              Subject: <span className="font-bold uppercase tracking-wide text-slate-900">{proforma.subject}</span>
+            </div>
+          )}
 
-        {/* Document footer */}
-        <div style={{ padding: "12px 16px", textAlign: "center" }}>
-          <p style={{ fontSize: 9, color: "#9CA3AF", letterSpacing: 1 }}>
-            This is a computer-generated document. No signature required.
-          </p>
-        </div>
+          {/* ══════════════ PRODUCTS TABULAR FORMAT ══════════════ */}
+          <div className="border border-slate-200 rounded-md overflow-hidden">
+            <table className="w-full border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-100/80 text-slate-800 font-semibold border-b border-slate-200">
+                  <th className="py-2 px-2 text-center w-10 border-r border-slate-200">#</th>
+                  <th className="py-2 px-3 text-left border-r border-slate-200">Item Description</th>
+                  <th className="py-2 px-2 text-center w-16 border-r border-slate-200">Qty</th>
+                  <th className="py-2 px-2.5 text-right w-28 border-r border-slate-200">
+                    <div>Rate ({getPrintCurrencySymbol(proforma.currencyType)})</div>
+                    <div className="text-[9px] font-normal text-slate-500">
+                      {proforma.paymentType === "Foreign" ? "Standard" : "(Incl. GST)"}
+                    </div>
+                  </th>
+                  {hasDiscounts && (
+                    <th className="py-2 px-2 text-right w-20 border-r border-slate-200">Discount</th>
+                  )}
+                  {proforma.paymentType !== "Foreign" && (
+                    <th className="py-2 px-2 text-center w-16 border-r border-slate-200">GST %</th>
+                  )}
+                  <th className="py-2 px-3 text-right w-32">
+                    <div>Total ({getPrintCurrencySymbol(proforma.currencyType)})</div>
+                    <div className="text-[9px] font-normal text-slate-500">
+                      {proforma.paymentType === "Foreign" ? "" : "(Incl. GST)"}
+                    </div>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 border-b border-slate-200">
+                {proforma.items.map((item, idx) => {
+                  const discountPercentage = (item as any).discountPercentage || 0
+                  const discountAmount = (item as any).discountAmount || 0
+                  const effectiveUnitPrice = item.unitPrice - discountAmount
+                  const lineTotal = effectiveUnitPrice * item.quantity
+
+                  return (
+                    <tr key={item.id || idx} className="hover:bg-slate-50/50">
+                      <td className="py-2 px-2 text-center font-medium text-slate-500 border-r border-slate-100 align-top">
+                        {idx + 1}
+                      </td>
+                      <td className="py-2 px-3 border-r border-slate-100 align-top">
+                        <div className="flex items-start gap-2">
+                          {item.imageUrl && (
+                            <div className="h-10 w-10 rounded border border-slate-200 bg-white p-0.5 shrink-0 overflow-hidden">
+                              <img
+                                src={getGoogleDrivePreviewUrl(item.imageUrl) || ""}
+                                alt={item.productName}
+                                className="h-full w-full object-contain"
+                                referrerPolicy="no-referrer"
+                              />
+                            </div>
+                          )}
+                          <div>
+                            <div className="font-bold text-slate-900 text-xs">{item.productName}</div>
+                            {item.name && item.name !== item.productName && (
+                              <div className="text-[10px] text-slate-500">{item.name}</div>
+                            )}
+                            {item.sku && (
+                              <div className="text-[10px] font-mono text-slate-400 mt-0.5">SKU: {item.sku}</div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="py-2 px-2 text-center font-semibold text-slate-800 border-r border-slate-100 align-top">
+                        {item.quantity} Nos
+                      </td>
+                      <td className="py-2 px-2.5 text-right font-medium text-slate-800 border-r border-slate-100 align-top">
+                        <div>
+                          {item.unitPrice.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </div>
+                        {proforma.paymentType !== "Foreign" && (
+                          <div className="text-[9px] text-emerald-700 font-medium">Incl. GST</div>
+                        )}
+                      </td>
+                      {hasDiscounts && (
+                        <td className="py-2 px-2 text-right border-r border-slate-100 align-top">
+                          {discountPercentage > 0 ? (
+                            <div>
+                              <span className="text-rose-600 font-semibold text-[11px]">
+                                {discountPercentage}%
+                              </span>
+                              <div className="text-[10px] text-slate-500">
+                                -{(discountAmount * item.quantity).toLocaleString("en-IN")}
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="text-slate-400">—</span>
+                          )}
+                        </td>
+                      )}
+                      {proforma.paymentType !== "Foreign" && (
+                        <td className="py-2 px-2 text-center font-medium text-slate-600 border-r border-slate-100 align-top">
+                          {item.gstRate}%
+                        </td>
+                      )}
+                      <td className="py-2 px-3 text-right font-bold text-slate-900 align-top">
+                        <div>
+                          {lineTotal.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </div>
+                        {proforma.paymentType !== "Foreign" && (
+                          <div className="text-[9px] text-slate-400 font-normal">Incl. GST</div>
+                        )}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+
+              {/* Totals Summary Footer Rows inside Table */}
+              <tfoot className="bg-slate-50/70 text-xs font-semibold text-slate-800">
+                <tr>
+                  <td
+                    colSpan={2 + (hasDiscounts ? 1 : 0) + (proforma.paymentType !== "Foreign" ? 1 : 0)}
+                    rowSpan={hasDiscounts ? (proforma.paymentType !== "Foreign" ? 5 : 3) : (proforma.paymentType !== "Foreign" ? 4 : 2)}
+                    className="p-3 border-r border-slate-200 align-top bg-white"
+                  >
+                    <div className="space-y-1 text-slate-700">
+                      <div className="font-bold text-[11px] uppercase tracking-wider text-slate-800">
+                        Commercial Terms:
+                      </div>
+                      <div className="text-[11px] grid grid-cols-[110px_1fr] gap-1">
+                        <span className="text-slate-500">Tax Clause:</span>
+                        <span className="font-semibold text-emerald-800">
+                          {proforma.paymentType === "Foreign" ? "Exempt / Export" : "All quoted prices include GST"}
+                        </span>
+                        <span className="text-slate-500">Payment Terms:</span>
+                        <span className="font-semibold text-slate-900">
+                          {proforma.paymentTerms || proforma.notes || "100% Advance"}
+                        </span>
+                        <span className="text-slate-500">Delivery Terms:</span>
+                        <span className="font-semibold text-slate-900">
+                          {proforma.deliveryTerms || proforma.deliveryTime || "Immediate Delivery"}
+                        </span>
+                        <span className="text-slate-500">Client GSTIN:</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {proforma.gstinNo || "Unregistered / URP"}
+                        </span>
+                      </div>
+                    </div>
+                  </td>
+                  <td colSpan={2} className="py-1.5 px-3 text-right text-slate-500 border-r border-slate-200">
+                    Gross Total (Incl. GST):
+                  </td>
+                  <td className="py-1.5 px-3 text-right font-medium text-slate-800">
+                    {getPrintCurrencySymbol(proforma.currencyType)}{" "}
+                    {originalSubtotal.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </td>
+                </tr>
+
+                {hasDiscounts && (
+                  <tr>
+                    <td colSpan={2} className="py-1.5 px-3 text-right text-rose-600 border-r border-slate-200">
+                      Total Discount:
+                    </td>
+                    <td className="py-1.5 px-3 text-right font-medium text-rose-600">
+                      - {getPrintCurrencySymbol(proforma.currencyType)}{" "}
+                      {totalDiscount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </td>
+                  </tr>
+                )}
+
+                {proforma.freight !== undefined && proforma.freight > 0 && (
+                  <tr>
+                    <td colSpan={2} className="py-1.5 px-3 text-right text-slate-500 border-r border-slate-200 text-[11px]">
+                      Freight Charges:
+                    </td>
+                    <td className="py-1.5 px-3 text-right font-normal text-slate-800 text-[11px]">
+                      + {getPrintCurrencySymbol(proforma.currencyType)}{" "}
+                      {proforma.freight.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </td>
+                  </tr>
+                )}
+
+                {proforma.paymentType !== "Foreign" && (
+                  <>
+                    <tr>
+                      <td colSpan={2} className="py-1.5 px-3 text-right text-slate-500 border-r border-slate-200 text-[11px]">
+                        Taxable Value (Excl. GST):
+                      </td>
+                      <td className="py-1.5 px-3 text-right font-normal text-slate-700 text-[11px]">
+                        {getPrintCurrencySymbol(proforma.currencyType)}{" "}
+                        {proforma.subtotal.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td colSpan={2} className="py-1.5 px-3 text-right text-slate-500 border-r border-slate-200 text-[11px]">
+                        GST Amount (Included):
+                      </td>
+                      <td className="py-1.5 px-3 text-right font-normal text-amber-700 text-[11px]">
+                        {getPrintCurrencySymbol(proforma.currencyType)}{" "}
+                        {proforma.taxAmount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                    </tr>
+                  </>
+                )}
+
+                <tr className="border-t border-slate-300 bg-slate-100/90 text-slate-900">
+                  <td colSpan={2} className="py-2 px-3 text-right font-bold text-sm border-r border-slate-200">
+                    Net Payable (Incl. GST):
+                  </td>
+                  <td className="py-2 px-3 text-right font-bold text-sm text-slate-950">
+                    {getPrintCurrencySymbol(proforma.currencyType)}{" "}
+                    {proforma.totalAmount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </PrintLayout>
       </div>
 
-      {/* ── Global print CSS injected inline ─────────────────────── */}
-      <style>{`
-        @media print {
-          .screen-only { display: none !important; }
-          .print-only  { display: block !important; }
-          body { margin: 0; padding: 0; }
-        }
-        @media screen {
-          .print-only  { display: none !important; }
-          .screen-only { display: flex; }
-        }
-      `}</style>
       <ProformaFormDialog
         open={isDialogOpen}
         onOpenChange={setIsDialogOpen}
@@ -631,3 +1285,4 @@ export function ProformaDetailsView({ proforma: initialProforma }: ProformaDetai
     </>
   )
 }
+

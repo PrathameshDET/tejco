@@ -19,6 +19,9 @@
 
 # production
 /build
+/dist
+/tejco-release
+/tejco-release/*
 
 # misc
 .DS_Store
@@ -35,7 +38,8 @@ yarn-error.log*
 
 # vercel
 .vercel
-
+.agents
+.agent
 # typescript
 *.tsbuildinfo
 next-env.d.ts

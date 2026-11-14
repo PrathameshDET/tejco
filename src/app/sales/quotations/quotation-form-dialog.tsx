@@ -1,4 +1,3 @@
-"use client"
 
 import { useState, useEffect } from "react"
 import { SalesDocument, SalesDocumentItem, SalesDocumentStatus } from "../types"
@@ -15,8 +14,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Loader2, Plus, Trash2, FileText, Calculator } from "lucide-react"
 import { ClientSelector } from "@/components/sales/client-selector"
 import { ProductSelector } from "@/components/sales/product-selector"
-import { quotationsApi, usersApi, serializeAddress } from "@/lib/api"
+import { quotationsApi, usersApi, serializeAddress, countryMasterApi, clientsApi } from "@/lib/api"
 import { toast } from "sonner"
+import { getGoogleDrivePreviewUrl } from "@/lib/utils"
+import { useAuth } from "@/hooks/use-auth"
 
 interface QuotationFormDialogProps {
   open: boolean
@@ -28,10 +29,46 @@ interface QuotationFormDialogProps {
 const GST_RATES = [0, 5, 12, 18, 28]
 
 export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: QuotationFormDialogProps) {
+  const { user } = useAuth()
   const [form, setForm] = useState<Partial<Quotation>>({})
   const [isSaving, setIsSaving] = useState(false)
   const [users, setUsers] = useState<any[]>([])
   const [loadingUsers, setLoadingUsers] = useState(false)
+  const [currencies, setCurrencies] = useState<string[]>(["USD", "EUR", "GBP"])
+  const [sameAsBilling, setSameAsBilling] = useState<boolean>(true)
+
+  useEffect(() => {
+    const fetchCurrencies = async () => {
+      try {
+        const res = await countryMasterApi.getAll()
+        const list = Array.isArray(res) ? res : ((res as any)?.data && Array.isArray((res as any).data) ? (res as any).data : [])
+        const uniqueCurrencies = Array.from(
+          new Set(
+            list
+              .map((c: any) => c.currencyType?.trim())
+              .filter((c: any) => c && c.toUpperCase() !== "INR")
+          )
+        ) as string[]
+        if (uniqueCurrencies.length > 0) {
+          setCurrencies(uniqueCurrencies)
+        }
+      } catch (err) {
+        console.error("Failed to fetch currencies from country master:", err)
+      }
+    }
+    fetchCurrencies()
+  }, [])
+
+  const getCurrencySymbol = (currency?: string) => {
+    if (!currency) return "₹"
+    switch (currency.toUpperCase()) {
+      case "USD": return "$"
+      case "EUR": return "€"
+      case "GBP": return "£"
+      case "INR": return "₹"
+      default: return currency
+    }
+  }
 
   useEffect(() => {
     const fetchUsers = async () => {
@@ -53,12 +90,31 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
 
   useEffect(() => {
     if (quotation) {
-      setForm(quotation)
+      const isSame = !quotation.shippingAddress || quotation.shippingAddress === quotation.billingAddress
+      setSameAsBilling(isSame)
+      setForm({
+        ...quotation,
+        quotationId: quotation.quotationId || (quotation.id && !isNaN(Number(quotation.id)) ? Number(quotation.id) : 0),
+        doctorSpeciality: Array.isArray((quotation as any).doctorSpeciality)
+          ? (quotation as any).doctorSpeciality.join(", ")
+          : ((quotation as any).doctorSpeciality || ""),
+        paymentType: (quotation as any).paymentType || "Domestic",
+        currencyType: (quotation as any).currencyType || "INR",
+        validityDays: quotation.validityDays || 7,
+        deliveryTime: quotation.deliveryTime || "10-15 Working Days",
+      })
     } else {
+      setSameAsBilling(true)
       const year = new Date().getFullYear()
       const random = Math.floor(1000 + Math.random() * 9000)
+      const currentUserName = user?.name || `${user?.firstName || ""} ${user?.lastName || ""}`.trim() || ""
+      const currentUserCell = user?.phone || user?.mobile || user?.mobileNumber || ""
+      const currentUserId = user?.userId !== undefined ? String(user.userId) : (user?.id !== undefined ? String(user.id) : "")
+
       setForm({
+        quotationId: 0,
         number: `QUO-${year}-${random}`,
+        quotationNumber: `QUO-${year}-${random}`,
         date: new Date().toISOString().split('T')[0],
         validUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
         status: "Draft",
@@ -68,39 +124,98 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
         totalAmount: 0,
         validityDays: 7,
         deliveryTime: "10-15 Working Days",
-        salesPersonName: "Ravi Kumar",
-        salesPersonCell: "+91-8888888888"
+        salesPersonName: currentUserName,
+        salesPersonCell: currentUserCell,
+        salesPersonId: currentUserId || undefined,
+        paymentType: "Domestic",
+        currencyType: "INR",
+        doctorSpeciality: "",
       })
     }
-  }, [quotation, open])
+  }, [quotation, open, user])
+
+  useEffect(() => {
+    const resolveClientId = async () => {
+      if (form.clientName && !form.clientId) {
+        try {
+          const res = await clientsApi.getAll()
+          const match = res.clients.find((c: any) => c.name?.toLowerCase().trim() === form.clientName?.toLowerCase().trim())
+          if (match) {
+            setForm(prev => ({
+              ...prev,
+              clientId: match.id,
+              billingAddress: prev.billingAddress || serializeAddress(match.billingAddress),
+              shippingAddress: prev.shippingAddress || serializeAddress(match.shippingAddress),
+              clientMobileNo: prev.clientMobileNo || match.phone || "",
+              gstinNo: prev.gstinNo || match.gstin || "",
+              doctorSpeciality: prev.doctorSpeciality || (Array.isArray(match.doctorSpeciality) ? match.doctorSpeciality.join(", ") : (match.doctorSpeciality || (match as any).speciality || "")),
+            }))
+          }
+        } catch (err) {
+          console.error("Failed to resolve client ID by name:", err)
+        }
+      }
+    }
+    if (open) {
+      resolveClientId()
+    }
+  }, [form.clientName, form.clientId, open])
 
   // Auto-match salesperson name to user list, or resolve mock/invalid salesPersonId
   useEffect(() => {
     if (users.length > 0 && form.salesPersonName) {
       const hasValidId = form.salesPersonId && users.some(u => String(u.userId) === String(form.salesPersonId))
-      
+
       if (!hasValidId) {
-        const match = users.find(u =>
-          `${u.firstName} ${u.lastName}`.trim().toLowerCase() === form.salesPersonName?.trim().toLowerCase()
-        )
+        const targetName = form.salesPersonName.trim().toLowerCase()
+        const match = users.find(u => {
+          const uFull = `${u.firstName || ""} ${u.lastName || ""}`.trim().toLowerCase()
+          const uName = (u.name || "").trim().toLowerCase()
+          return uFull === targetName || uName === targetName
+        })
         if (match) {
-          setForm(prev => ({ 
-            ...prev, 
+          setForm(prev => ({
+            ...prev,
             salesPersonId: String(match.userId),
             salesPersonCell: match.phone || match.mobile || prev.salesPersonCell || ""
           }))
+        } else if (user?.userId && String(form.salesPersonId) === String(user.userId)) {
+          // Keep current logged in user ID
         } else {
           // Clear invalid/mock salesPersonId so user is forced to select a valid one
           setForm(prev => ({ ...prev, salesPersonId: undefined }))
         }
       }
     }
-  }, [users, form.salesPersonName, form.salesPersonId])
+  }, [users, form.salesPersonName, form.salesPersonId, user?.userId])
 
   const calculateTotals = (items: SalesDocumentItem[]) => {
-    const subtotal = items.reduce((sum, item) => sum + (item.total || 0), 0)
-    const taxAmount = items.reduce((sum, item) => sum + ((item.total || 0) * (item.gstRate / 100)), 0)
+    const isForeign = form.paymentType === "Foreign"
+    const grossTotal = items.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0)
+
+    // Subtotal is sum of discounted base prices
+    const subtotal = items.reduce((sum, item) => {
+      const price = item.unitPrice || 0
+      const gstRate = isForeign ? 0 : (item.gstRate || 0)
+      const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+      const discAmt = (item as any).discountAmount || 0
+      const discountedBase = Math.max(0, basePrice - discAmt)
+      return sum + (discountedBase * item.quantity)
+    }, 0)
+
+    // Total GST calculated on the discounted base amount
+    const taxAmount = isForeign ? 0 : items.reduce((sum, item) => {
+      const price = item.unitPrice || 0
+      const gstRate = item.gstRate || 0
+      const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+      const discAmt = (item as any).discountAmount || 0
+      const discountedBase = Math.max(0, basePrice - discAmt)
+      return sum + (discountedBase * (gstRate / 100) * item.quantity)
+    }, 0)
+
+    // Grand total is subtotal + taxAmount
     const totalAmount = subtotal + taxAmount
+
     return { subtotal, taxAmount, totalAmount }
   }
 
@@ -109,44 +224,115 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
   }
 
   const onProductSelect = (product: any, variant: any) => {
+    const sku = `${product.baseSKU || ""}${variant.skuSuffix || ""}` || variant.variantName || product.productName
+    const exists = (form.items || []).some(item => item.sku === sku && (item as any).variantId === (variant.variantId || variant.id))
+    if (exists) {
+      toast.error(`"${product.productName} - ${variant.variantName}" is already included in this quotation.`)
+      return
+    }
+
+    const isForeign = form.paymentType === "Foreign"
+    const price = isForeign ? (variant.usdAmount || variant.exportSellingPrice || 0) : variant.sellingPrice
+
     const newItem: SalesDocumentItem = {
       id: Math.random().toString(36).substring(2, 9).slice(0, 8),
-      productId: product.productId.toString(),
+      productId: product.productId ? String(product.productId) : "0",
       productName: product.productName,
       name: variant.variantName,
-      sku: `${product.baseSKU}${variant.skuSuffix}`,
+      sku: sku,
       quantity: 1,
-      unitPrice: variant.sellingPrice,
-      total: variant.sellingPrice,
-      gstRate: variant.gstPercentage ?? 18,
-      imageUrl: variant.variantImage || product.imageUrl || "" 
+      unitPrice: price,
+      total: price,
+      gstRate: isForeign ? 0 : (variant.gstPercentage ?? product.gstPercentage ?? 18),
+      imageUrl: variant.variantImage || product.imageUrl || ""
     }
-    // Initialize discount fields
-    ;(newItem as any).discountPercentage = 0
-    ;(newItem as any).discountAmount = 0
+      // Initialize discount & relation fields
+      ; (newItem as any).quotationItemId = 0
+      ; (newItem as any).variantId = variant.variantId || variant.id || 0
+      ; (newItem as any).discountPercentage = 0
+      ; (newItem as any).discountAmount = 0
+      ; (newItem as any).stock = variant.currentQuantity ?? 0
+      ; (newItem as any).sellingPrice = variant.sellingPrice
+      ; (newItem as any).usdAmount = variant.usdAmount || variant.exportSellingPrice || 0
+      ; (newItem as any).gstRateOriginal = variant.gstPercentage ?? product.gstPercentage ?? 18
+
+    if ((variant.currentQuantity ?? 0) < 1) {
+      toast.warning(`Warning: "${product.productName} - ${variant.variantName}" is currently out of stock.`)
+    }
+
     const newItems = [...(form.items || []), newItem]
     const totals = calculateTotals(newItems)
     setForm(prev => ({ ...prev, items: newItems, ...totals }))
   }
 
-  const updateItem = (id: string, field: keyof SalesDocumentItem | "discountPercentage", value: any) => {
+  const updateItem = (id: string, field: keyof SalesDocumentItem | "discountPercentage" | "discountAmount", value: any) => {
+    const isForeign = form.paymentType === "Foreign"
     const newItems = (form.items || []).map(item => {
       if (item.id === id) {
-        const updatedItem = { ...item, [field]: value } as any
-        if (field === "quantity" || field === "unitPrice" || field === "discountPercentage") {
-          const qty = updatedItem.quantity || 0
-          const price = updatedItem.unitPrice || 0
-          const discPct = updatedItem.discountPercentage || 0
-          const discAmt = price * discPct / 100
-          updatedItem.discountAmount = discAmt
-          updatedItem.total = (price - discAmt) * qty
+        if (field === "quantity") {
+          const qty = parseInt(value) || 0
+          const stock = (item as any).stock
+          if (stock !== undefined && qty > stock) {
+            toast.error(`Requested quantity (${qty}) exceeds available stock (${stock}) for "${item.productName}".`)
+          }
         }
+        const updatedItem = { ...item, [field]: value } as any
+        const qty = updatedItem.quantity || 0
+        const price = updatedItem.unitPrice || 0
+        const gstRate = isForeign ? 0 : (updatedItem.gstRate || 0)
+
+        // 1. Minus GST from price to get base price:
+        const basePrice = gstRate > 0 ? price / (1 + gstRate / 100) : price
+
+        // 2. Apply discount on amount = price - GST amount (basePrice):
+        if (field === "discountPercentage") {
+          const discPct = Math.max(0, Math.min(100, parseFloat(value) || 0))
+          updatedItem.discountPercentage = discPct
+          const discAmt = parseFloat((basePrice * (discPct / 100)).toFixed(2))
+          updatedItem.discountAmount = discAmt
+        } else if (field === "discountAmount") {
+          const discAmt = Math.max(0, parseFloat(value) || 0)
+          updatedItem.discountAmount = discAmt
+          const discPct = basePrice > 0 ? parseFloat(((discAmt / basePrice) * 100).toFixed(2)) : 0
+          updatedItem.discountPercentage = discPct
+        } else if (field === "unitPrice") {
+          if (form.paymentType === "Foreign") {
+            updatedItem.usdAmount = price
+          } else {
+            updatedItem.sellingPrice = price
+          }
+          const discPct = updatedItem.discountPercentage || 0
+          updatedItem.discountAmount = parseFloat((basePrice * (discPct / 100)).toFixed(2))
+        }
+
+        // 3. Discounted base price after subtracting discount:
+        const discAmt = updatedItem.discountAmount || 0
+        const discountedBase = Math.max(0, basePrice - discAmt)
+
+        // 4. Apply mentioned GST % on the discounted amount to get the final unit price & line total:
+        const finalUnitPrice = gstRate > 0 ? discountedBase * (1 + gstRate / 100) : discountedBase
+        updatedItem.total = parseFloat((finalUnitPrice * qty).toFixed(2))
+
         return updatedItem as SalesDocumentItem
       }
       return item
     })
     const totals = calculateTotals(newItems)
     setForm(prev => ({ ...prev, items: newItems, ...totals }))
+  }
+
+  const handlePaymentTypeChange = (newPaymentType: string) => {
+    const newCurrency = newPaymentType === "Domestic" ? "INR" : "USD"
+    setForm(prev => ({
+      ...prev,
+      paymentType: newPaymentType,
+      currencyType: newCurrency,
+      items: [],
+      subtotal: 0,
+      taxAmount: 0,
+      totalAmount: 0
+    }))
+    toast.success("Payment type changed. Product selection cleared.")
   }
 
   const removeItem = (id: string) => {
@@ -162,49 +348,77 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
       return
     }
     setIsSaving(true)
-    
+
     try {
-      // Map frontend state to API payload
+      const quotationIdNum = quotation?.quotationId && !isNaN(Number(quotation.quotationId))
+        ? Number(quotation.quotationId)
+        : (quotation?.id && !isNaN(parseInt(quotation.id))
+          ? parseInt(quotation.id)
+          : (form.quotationId && !isNaN(Number(form.quotationId)) ? Number(form.quotationId) : 0))
+
+      // Map frontend state to exact backend API payload
       const payload = {
-        quotationId: quotation?.id && !isNaN(parseInt(quotation.id)) ? parseInt(quotation.id) : 0,
-        quotationNumber: form.number || "",
-        quotationDate: new Date(form.date || new Date()).toISOString(),
+        quotationId: quotationIdNum,
+        quotationNumber: form.quotationNumber || form.number || "",
+        quotationDate: form.quotationDate
+          ? new Date(form.quotationDate).toISOString()
+          : (form.date ? new Date(form.date).toISOString() : new Date().toISOString()),
         clientName: form.clientName || "",
-        clientAddress: form.billingAddress || "",
-        clientMobileNo: form.clientMobileNo || quotation?.clientMobileNo || "", 
-        subject: form.subject || form.notes || "Quotation", 
+        billingAddress: form.billingAddress || form.clientAddress || "",
+        shippingAddress: sameAsBilling ? (form.billingAddress || "") : (form.shippingAddress || form.billingAddress || form.clientAddress || ""),
+        clientAddress: form.billingAddress || form.clientAddress || form.shippingAddress || "",
+        clientMobileNo: form.clientMobileNo || quotation?.clientMobileNo || "",
+        subject: form.subject || "",
         gstinNo: form.gstinNo || "",
-        validityDays: form.validityDays || 7,
-        deliveryTime: form.deliveryTime || "7-10 Days",
-        salesPersonName: form.salesPersonName || "Admin",
-        salesPersonCell: form.salesPersonCell || "",
-        salesPersonId: form.salesPersonId ? String(form.salesPersonId) : "",
-        createdAt: new Date().toISOString(),
-        updatedAt: null,
+        validityDays: Number(form.validityDays) || 0,
+        deliveryTime: form.deliveryTime || "",
+        salesPersonId: form.salesPersonId && !isNaN(Number(form.salesPersonId)) ? Number(form.salesPersonId) : 0,
+        salesPersonName: form.salesPersonName || "",
         status: form.status || "Draft",
+        salesPersonCell: form.salesPersonCell || "",
+        createdAt: form.createdAt ? new Date(form.createdAt).toISOString() : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        totalAmount: Number(form.totalAmount) || 0,
+        paymentType: form.paymentType || "Domestic",
+        currencyType: form.currencyType || (form.paymentType === "Foreign" ? "USD" : "INR"),
+        doctorSpeciality: (() => {
+          const spec = form.doctorSpeciality || (quotation as any)?.doctorSpeciality
+          if (Array.isArray(spec)) {
+            return spec.map(s => String(s).trim()).filter(Boolean)
+          }
+          if (typeof spec === "string" && spec.trim()) {
+            return spec.split(",").map(s => s.trim()).filter(Boolean)
+          }
+          return []
+        })(),
+        doctorName: form.doctorName || (quotation as any)?.doctorName || form.clientName || "",
         items: (form.items || []).map(item => ({
-          quotationItemId: isNaN(parseInt(item.id)) ? 0 : parseInt(item.id),
-          quotationId: quotation?.id && !isNaN(parseInt(quotation.id)) ? parseInt(quotation.id) : 0,
-          productId: isNaN(parseInt(item.productId)) ? 0 : parseInt(item.productId),
+          quotationItemId: (item as any).quotationItemId && !isNaN(Number((item as any).quotationItemId))
+            ? Number((item as any).quotationItemId)
+            : (!isNaN(parseInt(item.id)) ? parseInt(item.id) : 0),
+          quotationId: quotationIdNum,
+          productId: item.productId && !isNaN(parseInt(item.productId)) ? parseInt(item.productId) : 0,
+          variantId: (item as any).variantId && !isNaN(Number((item as any).variantId)) ? Number((item as any).variantId) : 0,
           productName: item.productName || "",
-          itemName: item.name || "",
+          itemName: (item as any).itemName || item.name || item.productName || "",
           imageUrl: (item as any).imageUrl || "",
-          price: item.unitPrice || 0,
-          gstPercentage: item.gstRate || 0,
-          quantity: item.quantity || 0,
-          discountPercentage: (item as any).discountPercentage || 0,
-          discountAmount: (item as any).discountAmount || 0
+          price: Number(item.unitPrice ?? (item as any).price) || 0,
+          gstPercentage: Number(item.gstRate ?? (item as any).gstPercentage) || 0,
+          quantity: Number(item.quantity) || 0,
+          discountPercentage: Number((item as any).discountPercentage) || 0,
+          discountAmount: Number((item as any).discountAmount) || 0
         }))
       }
 
-      if (quotation?.id && !isNaN(parseInt(quotation.id))) {
-        await quotationsApi.update(quotation.id, payload)
+      if (quotationIdNum > 0 || (quotation?.id && !isNaN(parseInt(quotation.id)))) {
+        const updateId = quotation?.id || String(quotationIdNum)
+        await quotationsApi.update(updateId, payload)
         toast.success("Quotation updated successfully")
       } else {
         await quotationsApi.create(payload)
         toast.success("Quotation created successfully")
       }
-      
+
       onSave(form)
       onOpenChange(false)
     } catch (error: any) {
@@ -218,7 +432,7 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-5xl max-h-[95vh] flex flex-col p-0 overflow-hidden">
+      <DialogContent className="sm:max-w-6xl max-h-[95vh] flex flex-col p-0 overflow-hidden">
         <DialogHeader className="p-6 border-b bg-muted/20">
           <DialogTitle className="text-xl flex items-center gap-2">
             <FileText className="h-5 w-5 text-primary" />
@@ -244,33 +458,66 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* Payment Type + Currency Type */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="space-y-2">
+                <Label>Payment Type</Label>
+                <Select value={form.paymentType || "Domestic"} onValueChange={(v) => handlePaymentTypeChange(v as string)}>
+                  <SelectTrigger className="border-slate-200"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="Domestic">Domestic</SelectItem>
+                    <SelectItem value="Foreign">Foreign</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Currency Type</Label>
+                <Select value={form.currencyType || "INR"} disabled>
+                  <SelectTrigger className="border-slate-200 bg-slate-50 text-slate-500 cursor-not-allowed"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="INR">INR (₹)</SelectItem>
+                    <SelectItem value="USD">USD ($)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="space-y-2 min-w-0">
                 <Label>Client / Doctor *</Label>
-                <ClientSelector 
-                  selectedClientId={form.clientId} 
+                <ClientSelector
+                  selectedClientId={form.clientId}
                   selectedClientName={form.clientName}
                   onSelect={(c) => {
+                    const bAddr = serializeAddress(c.billingAddress)
+                    const sAddr = serializeAddress(c.shippingAddress)
+                    const isSame = !sAddr || sAddr === bAddr
+                    setSameAsBilling(isSame)
                     set("clientId", c.id)
                     set("clientName", c.name)
                     set("clientMobileNo", c.phone || "")
-                    set("billingAddress", serializeAddress(c.billingAddress))
-                    set("shippingAddress", serializeAddress(c.shippingAddress))
+                    set("billingAddress", bAddr)
+                    set("shippingAddress", isSame ? bAddr : sAddr)
                     set("gstinNo", c.gstin)
-                  }} 
+                    set("doctorSpeciality", Array.isArray(c.doctorSpeciality) ? c.doctorSpeciality.join(", ") : (c.doctorSpeciality || (c as any).speciality || (c as any).clientType || form.doctorSpeciality || ""))
+                    set("doctorName", (c as any).doctorName || c.contactPerson || (c.clientType === "Doctor" ? c.name : form.doctorName || ""))
+                  }}
                 />
               </div>
-              <div className="space-y-2">
+              <div className="space-y-2 min-w-0">
                 <Label>Sales Representative *</Label>
-                <Select 
+                <Select
                   value={form.salesPersonName || ""}
                   onValueChange={(val) => {
-                    const selectedUser = users.find(u => `${u.firstName} ${u.lastName}` === val)
+                    const selectedUser = users.find(u => {
+                      const uFull = `${u.firstName || ""} ${u.lastName || ""}`.trim()
+                      return uFull === val || u.name === val
+                    })
                     if (selectedUser) {
                       setForm(prev => ({
                         ...prev,
                         salesPersonName: val,
-                        salesPersonCell: selectedUser.phone || "",
+                        salesPersonCell: selectedUser.phone || selectedUser.mobile || "",
                         salesPersonId: String(selectedUser.userId)
                       } as Partial<Quotation>))
                     } else {
@@ -282,12 +529,12 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
                     }
                   }}
                 >
-                  <SelectTrigger>
-                    <SelectValue placeholder={loadingUsers ? "Loading..." : "Select Sales Person"} />
+                  <SelectTrigger className="w-full min-w-0 overflow-hidden">
+                    <SelectValue placeholder={loadingUsers ? "Loading..." : "Select Sales Person"} className="truncate" />
                   </SelectTrigger>
                   <SelectContent>
                     {users.map(u => {
-                      const fullName = `${u.firstName} ${u.lastName}`
+                      const fullName = (u.name || `${u.firstName || ""} ${u.lastName || ""}`.trim()) || `User ${u.userId}`
                       return (
                         <SelectItem key={u.userId} value={fullName}>
                           {fullName}
@@ -297,26 +544,59 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-2">
+              <div className="space-y-2 min-w-0">
                 <Label>Status</Label>
                 <Select value={form.status} onValueChange={(v) => set("status", v as SalesDocumentStatus)}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectTrigger className="w-full min-w-0"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="Draft">Draft</SelectItem>
-                    <SelectItem value="Issued">Issued</SelectItem>
+                    <SelectItem value="Sent to Client">Sent to Client</SelectItem>
+                    <SelectItem value="Accepted">Accepted</SelectItem>
+                    <SelectItem value="Rejected">Rejected</SelectItem>
+                    <SelectItem value="Converted To PI">Converted To PI</SelectItem>
+                    <SelectItem value="Converted To Sales Order">Converted To Sales Order</SelectItem>
                     <SelectItem value="Cancelled">Cancelled</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
             </div>
 
-            <div className="space-y-2">
-              <Label>Subject *</Label>
-              <Input 
-                placeholder="e.g. Surgical Blade L4, Testing Item Discounts, etc." 
-                value={form.subject || ""} 
-                onChange={(e) => set("subject", e.target.value)} 
-              />
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="space-y-2 min-w-0">
+                <Label>Subject *</Label>
+                <Input
+                  placeholder="e.g. Surgical Blade L4, Testing Item Discounts, etc."
+                  value={form.subject || ""}
+                  onChange={(e) => set("subject", e.target.value)}
+                />
+              </div>
+              <div className="space-y-2 min-w-0">
+                <Label>Doctor Speciality</Label>
+                <Input
+                  placeholder="e.g. Dermatologist, Trichologist, Surgeon"
+                  value={form.doctorSpeciality || ""}
+                  onChange={(e) => set("doctorSpeciality", e.target.value)}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3 min-w-0">
+                <div className="space-y-2 min-w-0">
+                  <Label>Validity (Days)</Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={form.validityDays ?? 7}
+                    onChange={(e) => set("validityDays", parseInt(e.target.value) || 7)}
+                  />
+                </div>
+                <div className="space-y-2 min-w-0">
+                  <Label>Delivery Time</Label>
+                  <Input
+                    placeholder="e.g. 10-15 Working Days"
+                    value={form.deliveryTime || ""}
+                    onChange={(e) => set("deliveryTime", e.target.value)}
+                  />
+                </div>
+              </div>
             </div>
 
             <Separator />
@@ -325,103 +605,125 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">Line Items</h3>
-                <ProductSelector onSelect={onProductSelect} />
+                <ProductSelector onSelect={onProductSelect} paymentType={form.paymentType} />
               </div>
 
               <div className="border rounded-md overflow-hidden">
                 <Table>
                   <TableHeader>
                     <TableRow className="bg-muted/50">
-                      <TableHead className="w-[25%]">Product</TableHead>
-                      <TableHead>SKU</TableHead>
-                      <TableHead className="w-[10%] text-center">Qty</TableHead>
-                      <TableHead className="w-[12%] text-right">Price</TableHead>
-                      <TableHead className="w-[12%] text-center">Disc %</TableHead>
-                      <TableHead className="w-[12%] text-center">GST %</TableHead>
-                      <TableHead className="w-[15%] text-right">Total</TableHead>
-                      <TableHead className="w-[50px]"></TableHead>
+                      <TableHead className="w-[20%]">Product</TableHead>
+                      <TableHead className="w-[11%]">Variant</TableHead>
+                      <TableHead className="w-[6%] text-center">Qty</TableHead>
+                      <TableHead className="w-[18%] text-right">Price</TableHead>
+                      <TableHead className="w-[7%] text-center">Disc %</TableHead>
+                      <TableHead className="w-[11%] text-right">Disc Amt</TableHead>
+                      <TableHead className="w-[7%] text-center">GST %</TableHead>
+                      <TableHead className="w-[16%] text-right">Total</TableHead>
+                      <TableHead className="w-[40px]"></TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {(form.items || []).length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={8} className="h-24 text-center text-muted-foreground italic">
+                        <TableCell colSpan={9} className="h-24 text-center text-muted-foreground italic">
                           No items added. Click "Add Product" to search the inventory.
                         </TableCell>
                       </TableRow>
                     ) : (
-                      (form.items || []).map((item) => (
-                        <TableRow key={item.id}>
-                          <TableCell className="font-medium">
-                            <div className="flex items-center gap-3">
-                              {(item as any).imageUrl && (
-                                <div className="h-10 w-10 rounded border border-slate-100 overflow-hidden bg-slate-50 flex-shrink-0 flex items-center justify-center">
-                                  <img src={(item as any).imageUrl} alt={item.productName} className="h-full w-full object-contain" />
+                      (form.items || []).map((item) => {
+                        const isOverStock = (item as any).stock !== undefined && item.quantity > (item as any).stock
+                        return (
+                          <TableRow
+                            key={item.id}
+                            className={isOverStock ? "bg-orange-50/80 hover:bg-orange-100/80 border-orange-200 transition-colors" : "hover:bg-slate-50/50"}
+                          >
+                            <TableCell className="font-medium">
+                              <div className="flex items-center gap-3">
+                                {(item as any).imageUrl && (
+                                  <div className="h-10 w-10 rounded border border-slate-100 overflow-hidden bg-slate-50 flex-shrink-0 flex items-center justify-center">
+                                    <img src={getGoogleDrivePreviewUrl((item as any).imageUrl) || ""} alt={item.productName} className="h-full w-full object-contain" referrerPolicy="no-referrer" />
+                                  </div>
+                                )}
+                                <div className="min-w-0">
+                                  <div className="font-medium text-slate-900 truncate" title={item.productName}>{item.productName}</div>
+                                  <div className="text-[11px] text-muted-foreground font-mono">{item.name}</div>
                                 </div>
-                              )}
-                              <div>
-                                <div className="font-medium text-slate-900">{item.productName}</div>
-                                {item.name && <div className="text-xs text-slate-500">{item.name}</div>}
                               </div>
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-xs font-mono">{item.sku}</TableCell>
-                          <TableCell>
-                            <Input 
-                              type="number" 
-                              min="1" 
-                              value={item.quantity ?? ""} 
-                              onChange={(e) => updateItem(item.id, "quantity", parseInt(e.target.value) || 0)}
-                              className="h-8 text-center"
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <Input 
-                              type="number" 
-                              value={item.unitPrice ?? ""} 
-                              onChange={(e) => updateItem(item.id, "unitPrice", parseFloat(e.target.value) || 0)}
-                              className="h-8 text-right"
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <Input 
-                              type="number" 
-                              min="0"
-                              max="100"
-                              value={(item as any).discountPercentage ?? 0} 
-                              onChange={(e) => updateItem(item.id, "discountPercentage", parseFloat(e.target.value) || 0)}
-                              className="h-8 text-center"
-                              placeholder="0"
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <Select 
-                              value={item.gstRate.toString()} 
-                              onValueChange={(v) => v && updateItem(item.id, "gstRate", parseInt(v))}
-                            >
-                              <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
-                              <SelectContent>
-                                {GST_RATES.map(rate => (
-                                  <SelectItem key={rate} value={rate.toString()}>{rate}%</SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </TableCell>
-                          <TableCell className="text-right font-medium">
-                            ₹{item.total.toLocaleString()}
-                          </TableCell>
-                          <TableCell>
-                            <Button 
-                              variant="ghost" 
-                              size="icon" 
-                              onClick={() => removeItem(item.id)}
-                              className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      ))
+                            </TableCell>
+                            <TableCell className="text-xs text-slate-700 font-medium">
+                              {item.name || "—"}
+                            </TableCell>
+                            <TableCell>
+                              <Input
+                                type="number"
+                                min="1"
+                                value={item.quantity ?? ""}
+                                onChange={(e) => updateItem(item.id, "quantity", parseInt(e.target.value) || 0)}
+                                className="h-8 text-center border-0 bg-transparent hover:bg-slate-100/80 focus-visible:bg-white focus-visible:ring-1 focus-visible:ring-primary shadow-none font-medium px-1 no-spinner"
+                              />
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex flex-col items-end">
+                                <div className="flex items-center justify-end gap-1 w-full">
+                                  <span className="text-xs text-muted-foreground font-semibold">{getCurrencySymbol(form.currencyType)}</span>
+                                  <Input
+                                    type="number"
+                                    value={item.unitPrice ?? ""}
+                                    onChange={(e) => updateItem(item.id, "unitPrice", parseFloat(e.target.value) || 0)}
+                                    className="h-8 text-right border-0 bg-transparent hover:bg-slate-100/80 focus-visible:bg-white focus-visible:ring-1 focus-visible:ring-primary shadow-none font-semibold px-1 no-spinner w-full min-w-[90px]"
+                                  />
+                                </div>
+                                {form.paymentType !== "Foreign" && (item.gstRate || 0) > 0 && (
+                                  <div className="text-[10px] text-muted-foreground whitespace-nowrap pr-1">
+                                    Base: {getCurrencySymbol(form.currencyType)}{((item.unitPrice || 0) / (1 + (item.gstRate || 0) / 100)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                  </div>
+                                )}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <Input
+                                type="number"
+                                min="0"
+                                max="100"
+                                value={(item as any).discountPercentage !== undefined && (item as any).discountPercentage !== 0 ? (item as any).discountPercentage : ""}
+                                onChange={(e) => updateItem(item.id, "discountPercentage", e.target.value === "" ? 0 : parseFloat(e.target.value))}
+                                className="h-8 text-center border-0 bg-transparent hover:bg-slate-100/80 focus-visible:bg-white focus-visible:ring-1 focus-visible:ring-primary shadow-none font-medium px-1 no-spinner"
+                                placeholder="0"
+                              />
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center justify-end gap-1">
+                                <span className="text-xs text-muted-foreground font-semibold">{getCurrencySymbol(form.currencyType)}</span>
+                                <Input
+                                  type="number"
+                                  min="0"
+                                  value={(item as any).discountAmount !== undefined && (item as any).discountAmount !== 0 ? (item as any).discountAmount : ""}
+                                  onChange={(e) => updateItem(item.id, "discountAmount", e.target.value === "" ? 0 : parseFloat(e.target.value))}
+                                  className="h-8 text-right border-0 bg-transparent hover:bg-slate-100/80 focus-visible:bg-white focus-visible:ring-1 focus-visible:ring-primary shadow-none font-medium px-1 no-spinner w-full"
+                                  placeholder="0.00"
+                                />
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-center font-medium text-slate-600 bg-slate-50/50 text-xs">
+                              {item.gstRate}%
+                            </TableCell>
+                            <TableCell className="text-right font-semibold text-slate-900 whitespace-nowrap">
+                              {getCurrencySymbol(form.currencyType)}{item.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </TableCell>
+                            <TableCell>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                onClick={() => removeItem(item.id)}
+                                className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })
                     )}
                   </TableBody>
                 </Table>
@@ -433,43 +735,110 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
               <div className="space-y-4">
                 <div className="space-y-2">
                   <Label>Billing Address</Label>
-                  <Textarea 
-                    placeholder="Full billing address..." 
-                    rows={2} 
-                    value={form.billingAddress || ""} 
-                    onChange={(e) => set("billingAddress", e.target.value)} 
+                  <Textarea
+                    placeholder="Full billing address..."
+                    rows={2}
+                    value={form.billingAddress || ""}
+                    onChange={(e) => {
+                      const val = e.target.value
+                      setForm(prev => ({
+                        ...prev,
+                        billingAddress: val,
+                        ...(sameAsBilling ? { shippingAddress: val } : {})
+                      }))
+                    }}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Shipping Address</Label>
-                  <Textarea 
-                    placeholder="Full shipping address..." 
-                    rows={2} 
-                    value={form.shippingAddress || ""} 
-                    onChange={(e) => set("shippingAddress", e.target.value)} 
+                  <div className="flex items-center justify-between">
+                    <Label>Shipping Address</Label>
+                    <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        className="rounded border-gray-300 text-primary focus:ring-primary h-3.5 w-3.5"
+                        checked={sameAsBilling}
+                        onChange={(e) => {
+                          const checked = e.target.checked
+                          setSameAsBilling(checked)
+                          if (checked) {
+                            setForm(prev => ({ ...prev, shippingAddress: prev.billingAddress || "" }))
+                          }
+                        }}
+                      />
+                      Shipping address is same as billing address
+                    </label>
+                  </div>
+                  <Textarea
+                    placeholder="Full shipping address..."
+                    rows={2}
+                    disabled={sameAsBilling}
+                    value={sameAsBilling ? (form.billingAddress || "") : (form.shippingAddress || "")}
+                    onChange={(e) => set("shippingAddress", e.target.value)}
                   />
                 </div>
               </div>
 
               <div className="bg-muted/30 p-6 rounded-xl space-y-4 border border-muted-foreground/10">
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Subtotal (Gross)</span>
-                  <span className="font-medium">₹{form.items?.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0)?.toLocaleString()}</span>
-                </div>
-                {form.items?.some(item => (item as any).discountAmount > 0) && (
-                  <div className="flex justify-between text-sm">
-                    <span className="text-muted-foreground">Total Discount</span>
-                    <span className="font-medium text-rose-600">- ₹{form.items?.reduce((sum, item) => sum + (((item as any).discountAmount || 0) * item.quantity), 0)?.toLocaleString()}</span>
-                  </div>
+                {form.paymentType === "Foreign" ? (
+                  <>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Gross Total</span>
+                      <span className="font-medium">{getCurrencySymbol(form.currencyType)}{form.items?.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0)?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                    </div>
+                    {form.items?.some(item => (item as any).discountAmount > 0) && (
+                      <div className="flex justify-between text-sm">
+                        <span className="text-muted-foreground">Total Discount</span>
+                        <span className="font-medium text-rose-600">- {getCurrencySymbol(form.currencyType)}{form.items?.reduce((sum, item) => sum + (((item as any).discountAmount || 0) * item.quantity), 0)?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {/* 1. Base Amount (Price minus GST) */}
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Gross Base Value (Excl. GST)</span>
+                      <span className="font-medium">
+                        {getCurrencySymbol(form.currencyType)}
+                        {form.items?.reduce((sum, item) => {
+                          const price = item.unitPrice || 0
+                          const gstRate = item.gstRate || 0
+                          const base = gstRate > 0 ? price / (1 + gstRate / 100) : price
+                          return sum + (base * item.quantity)
+                        }, 0)?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                    </div>
+
+                    {/* 2. Total Discount applied on Base Amount */}
+                    {form.items?.some(item => (item as any).discountAmount > 0) && (
+                      <div className="flex justify-between text-sm">
+                        <span className="text-muted-foreground">Total Discount (On Base Value)</span>
+                        <span className="font-medium text-rose-600">
+                          - {getCurrencySymbol(form.currencyType)}
+                          {form.items?.reduce((sum, item) => sum + (((item as any).discountAmount || 0) * item.quantity), 0)?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* 3. Net Taxable Subtotal (Base minus Discount) */}
+                    <div className="flex justify-between text-sm font-medium">
+                      <span className="text-slate-700">Taxable Subtotal</span>
+                      <span className="text-slate-900">{getCurrencySymbol(form.currencyType)}{form.subtotal?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                    </div>
+
+                    <Separator className="bg-slate-200/60" />
+
+                    {/* 4. GST on Discounted Taxable Base */}
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Total GST</span>
+                      <span className="font-medium text-emerald-600">+ {getCurrencySymbol(form.currencyType)}{form.taxAmount?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                    </div>
+                  </>
                 )}
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Total GST</span>
-                  <span className="font-medium text-amber-600">+ ₹{form.taxAmount?.toLocaleString()}</span>
-                </div>
+
                 <Separator />
                 <div className="flex justify-between font-bold text-xl items-baseline">
                   <span>Grand Total</span>
-                  <span className="text-primary tracking-tight font-extrabold text-2xl">₹{form.totalAmount?.toLocaleString()}</span>
+                  <span className="text-primary tracking-tight font-extrabold text-2xl">{getCurrencySymbol(form.currencyType)}{form.totalAmount?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                 </div>
                 <div className="pt-2 flex items-center gap-2 text-[10px] text-muted-foreground uppercase tracking-widest font-semibold opacity-60">
                   <Calculator className="h-3 w-3" />
@@ -480,10 +849,10 @@ export function QuotationFormDialog({ open, onOpenChange, quotation, onSave }: Q
 
             <div className="space-y-2 pt-4">
               <Label>Notes / Terms & Conditions</Label>
-              <Textarea 
-                placeholder="Validity period, payment terms, or other instructions..." 
-                value={form.notes || ""} 
-                onChange={(e) => set("notes", e.target.value)} 
+              <Textarea
+                placeholder="Validity period, payment terms, or other instructions..."
+                value={form.notes || ""}
+                onChange={(e) => set("notes", e.target.value)}
               />
             </div>
           </div>

@@ -10,37 +10,28 @@
 
 import { apiClient } from "./api-client"
 export { apiClient }
-import type { Client, ClientDelivery, Address, ClientContact } from "@/app/stakeholders/clients/types"
-import type { Vendor } from "@/app/supply-chain/vendors/types"
-import type { Warehouse, ApiWarehouse } from "@/app/supply-chain/warehouse/types"
+import type { Client, ClientDelivery, Address, ClientContact, CreateClientPayload } from "@/app/stakeholders/clients/types"
+import type { Vendor, CreateVendorDto } from "@/app/supply-chain/vendors/types"
+import type { Warehouse, ApiWarehouse, Rack } from "@/app/supply-chain/warehouse/types"
 
 // Helpers
 export const serializeAddress = (a?: Address) => a ? `${a.street1}|${a.street2 || ""}|${a.city}|${a.state}|${a.pincode}|${a.country}` : ""
 const deserializeAddress = (s: any): Address => {
   const p = String(s || "").split("|")
-  return { 
-    street1: p[0] || "", 
-    street2: p[1] || "", 
-    city: p[2] || "", 
-    state: p[3] || "", 
-    pincode: p[4] || "", 
-    country: p[5] || "India" 
+  return {
+    street1: p[0] || "",
+    street2: p[1] || "",
+    city: p[2] || "",
+    state: p[3] || "",
+    pincode: p[4] || "",
+    country: p[5] || "India"
   }
 }
 
 // ---------------------------------------------------------------------------
 // Payload types — shapes expected by the backend
 // ---------------------------------------------------------------------------
-
-export interface CreateClientPayload {
-  clientId: number       // 0 for new records
-  clientName: string
-  billingAddress: string
-  shippingAddress: string
-  gstin: string
-  contactPerson: string
-  contactNumber: string
-}
+export type { CreateClientPayload }
 
 /** Raw shape returned by the backend for GET /api/Clients and GET /api/Clients/{id} */
 export interface ApiClient {
@@ -57,8 +48,29 @@ export interface ApiClient {
 
 /** Maps the backend ApiClient shape to the UI Client type */
 export function mapApiClient(raw: ApiClient): Client {
+  if (!raw) {
+    return {
+      id: "0",
+      name: "Unknown",
+      contactPerson: "",
+      company: "",
+      email: "",
+      phone: "",
+      status: "Active",
+      clientType: "Clinic",
+      hasBranches: false,
+      branches: [],
+      joinedDate: "",
+      address: "",
+      billingAddress: { street1: "", city: "", state: "", pincode: "", country: "" },
+      shippingAddress: { street1: "", city: "", state: "", pincode: "", country: "" },
+      contacts: [],
+      instagramUrl: "",
+    }
+  }
+
   let extra: any = {}
-  
+
   // Handle case where shippingAddress might be a string with JSON or legacy pipe format
   let mainShippingAddress = raw.shippingAddress
   if (typeof raw.shippingAddress === "string" && raw.shippingAddress.includes("|||")) {
@@ -73,28 +85,58 @@ export function mapApiClient(raw: ApiClient): Client {
 
   const parseAddr = (addr: any): Address => {
     if (!addr) return { street1: "", city: "", state: "", pincode: "", country: "" }
-    if (typeof addr === 'object' && addr.street1 !== undefined) return addr as Address
+    if (typeof addr === 'object' && addr.street1 !== undefined) {
+      // Return a new plain object to ensure serializability
+      return {
+        street1: String(addr.street1 || ""),
+        street2: String(addr.street2 || ""),
+        city: String(addr.city || ""),
+        state: String(addr.state || ""),
+        pincode: String(addr.pincode || ""),
+        country: String(addr.country || ""),
+      }
+    }
     return deserializeAddress(addr)
   }
 
+  const r = raw as any
+
   return {
-    id: String(raw.clientId),
-    name: raw.name || "",
-    contactPerson: raw.contactPerson || extra.contactPerson || "",
-    company: raw.company || raw.name || "",
-    email: raw.email || extra.email || "",
-    phone: raw.phone || "",
-    status: (raw as any).status || extra.status || "Active",
-    clientType: (raw as any).clientType || extra.clientType || "Clinic",
-    hasBranches: (raw as any).hasBranches || extra.hasBranches || false,
-    branches: (raw as any).branches || extra.branches || [],
-    joinedDate: (raw as any).joinedDate || extra.joinedDate || new Date().toISOString(),
+    id: String(raw.clientId ?? 0),
+    name: String(raw.name || ""),
+    contactPerson: String(raw.contactPerson || extra.contactPerson || ""),
+    company: String(raw.company || raw.name || ""),
+    email: String(raw.email || extra.email || ""),
+    phone: String(raw.phone || ""),
+    status: (r.status || extra.status || "Active") as Client["status"],
+    clientType: (r.clientType || extra.clientType || "") as Client["clientType"],
+    doctorSpeciality: String(r.doctorSpeciality || extra.doctorSpeciality || ""),
+    hasBranches: Boolean(r.hasBranches || extra.hasBranches || false),
+    branches: Array.isArray(r.branches) ? r.branches : Array.isArray(extra.branches) ? extra.branches : [],
+    joinedDate: String(r.joinedDate || extra.joinedDate || ""),
     address: typeof raw.billingAddress === 'string' ? raw.billingAddress : "", // legacy
-    billingAddress: extra.billingAddress || parseAddr(raw.billingAddress),
-    shippingAddress: extra.shippingAddress || parseAddr(mainShippingAddress),
-    gstin: raw.gstin || undefined,
-    contacts: (raw as any).contacts || extra.contacts || [],
+    billingAddress: extra.billingAddress ? parseAddr(extra.billingAddress) : parseAddr(raw.billingAddress),
+    shippingAddress: extra.shippingAddress ? parseAddr(extra.shippingAddress) : parseAddr(mainShippingAddress),
+    gstin: raw.gstin ? String(raw.gstin) : undefined,
+    contacts: Array.isArray(r.contacts) ? r.contacts : Array.isArray(extra.contacts) ? extra.contacts : [],
+    instagramUrl: String(r.instagramUrl || extra.instagramUrl || ""),
+    dateOfBirth: r.dateOfBirth ? String(r.dateOfBirth) : undefined,
   }
+}
+
+
+export interface ClientGetAllParams {
+  pageNumber?: number
+  pageSize?: number
+  sortBy?: string
+  sortDir?: string
+  search?: string
+  searchBy?: string
+}
+
+export interface ClientGetAllResponse {
+  clients: Client[]
+  totalCount: number
 }
 
 // ---------------------------------------------------------------------------
@@ -102,115 +144,330 @@ export function mapApiClient(raw: ApiClient): Client {
 // ---------------------------------------------------------------------------
 
 export const clientsApi = {
-  /** GET /api/Clients — fetch all clients */
-  getAll: async (): Promise<Client[]> => {
+  /** GET /api/Client/GetAll — fetch clients with pagination & filtering */
+  getAll: async (params?: ClientGetAllParams): Promise<ClientGetAllResponse> => {
     try {
-      const raw = await apiClient.get<any>("/api/Client/GetAll")
-      if (Array.isArray(raw)) return raw.map(mapApiClient)
-      if (raw?.data && Array.isArray(raw.data)) return raw.data.map(mapApiClient)
-      return []
+      const query = new URLSearchParams()
+      if (params?.pageNumber) query.append("pageNumber", String(params.pageNumber))
+      if (params?.pageSize) query.append("pageSize", String(params.pageSize))
+      if (params?.sortBy) query.append("sortBy", params.sortBy)
+      if (params?.sortDir) query.append("sortDir", params.sortDir)
+      if (params?.search) query.append("search", params.search)
+      if (params?.searchBy) query.append("searchBy", params.searchBy)
+
+      const queryString = query.toString() ? `?${query.toString()}` : ""
+      const raw = await apiClient.get<any>(`/api/Client/GetAll${queryString}`)
+
+      let clients: Client[] = []
+      let totalCount = 0
+
+      if (Array.isArray(raw)) {
+        clients = raw.map(mapApiClient)
+        totalCount = clients.length
+      } else if (raw?.data && Array.isArray(raw.data)) {
+        clients = raw.data.map(mapApiClient)
+        totalCount = raw.totalCount ?? raw.total ?? clients.length
+      }
+
+      return { clients, totalCount }
     } catch (err) {
       console.error("Failed to fetch clients:", err)
-      return []
+      return { clients: [], totalCount: 0 }
     }
   },
 
   /** GET /api/Clients/{id} — fetch a single client */
   getById: async (id: string): Promise<Client> => {
-    const raw = await apiClient.get<ApiClient>(`/api/Client/GetById/${id}`)
-    return mapApiClient(raw)
+    const raw = await apiClient.get<any>(`/api/Client/GetById/${id}`)
+    const data = raw?.data || raw
+    return mapApiClient(data)
   },
 
   /** GET /api/Clients/{id}/deliveries — fetch delivery history for a client */
-  getDeliveries: (id: string) =>
-    apiClient.get<ClientDelivery[]>(`/api/Client/${id}/deliveries`),
+  getDeliveries: async (id: string): Promise<ClientDelivery[]> => {
+    const raw = await apiClient.get<any>(`/api/Client/${id}/deliveries`)
+    if (Array.isArray(raw)) return raw
+    if (raw?.data && Array.isArray(raw.data)) return raw.data
+    return []
+  },
 
-  /** POST /api/Clients — create a new client */
-  create: (data: Partial<Client>) => {
-    const extra = {
-      email: data.email,
-      clientType: data.clientType,
-      hasBranches: data.hasBranches,
-      branches: data.branches,
-      contacts: data.contacts,
-      status: data.status,
-      billingAddress: data.billingAddress,
-      shippingAddress: data.shippingAddress,
-      joinedDate: data.joinedDate || new Date().toISOString()
-    }
-    
-    // We store the searchable/readable string in the main field, and the object in the hidden segment
-    const billingStr = serializeAddress(data.billingAddress)
-    const shippingStr = serializeAddress(data.shippingAddress)
-    const finalShippingSegment = `${shippingStr}|||${JSON.stringify(extra)}`
-
-    const payload = {
+  /** POST /api/Client/Create — create a new client */
+  create: (data: Partial<CreateClientPayload> | Partial<Client>) => {
+    const payload: CreateClientPayload = {
       clientId: 0,
-      clientName: data.name ?? "",
-      billingAddress: billingStr,
-      shippingAddress: finalShippingSegment,
-      gstin: data.gstin ?? "",
-      contactPerson: data.contactPerson ?? data.name ?? "",
-      contactNumber: data.phone ?? "",
-    }
-    return apiClient.post<any>("/api/Client", payload)
-  },
-
-  /** PUT /api/Clients/{id} — update an existing client */
-  update: (id: string, data: Partial<Client>) => {
-    const extra = {
-      email: data.email,
-      clientType: data.clientType,
-      hasBranches: data.hasBranches,
-      branches: data.branches,
-      contacts: data.contacts,
-      status: data.status,
-      billingAddress: data.billingAddress,
-      shippingAddress: data.shippingAddress,
+      name: (data.name || "").trim(),
+      company: (data.company || data.name || "").trim(),
+      contactPerson: (data.contactPerson || data.name || "").trim(),
+      email: (data.email || "").trim(),
+      phone: (data.phone || "").trim(),
+      status: data.status || "Active",
+      clientType: data.clientType || "Clinic",
+      doctorSpeciality: (data.doctorSpeciality || "").trim(),
+      hasBranches: (data.branches && data.branches.length > 0) || Boolean(data.hasBranches),
+      gstin: (data.gstin || "").trim(),
       joinedDate: data.joinedDate
+        ? (data.joinedDate.includes("T") ? data.joinedDate : new Date(data.joinedDate).toISOString())
+        : new Date().toISOString(),
+      instagramUrl: (data.instagramUrl || "").trim(),
+      dateOfBirth: data.dateOfBirth
+        ? (data.dateOfBirth.includes("T") ? data.dateOfBirth : new Date(data.dateOfBirth).toISOString())
+        : new Date().toISOString(),
+      billingAddress: {
+        street1: (data.billingAddress?.street1 || "").trim(),
+        street2: (data.billingAddress?.street2 || "").trim(),
+        city: (data.billingAddress?.city || "").trim(),
+        state: (data.billingAddress?.state || "").trim(),
+        pincode: String(data.billingAddress?.pincode || "").trim(),
+        country: (data.billingAddress?.country || "India").trim(),
+      },
+      shippingAddress: {
+        street1: (data.shippingAddress?.street1 || "").trim(),
+        street2: (data.shippingAddress?.street2 || "").trim(),
+        city: (data.shippingAddress?.city || "").trim(),
+        state: (data.shippingAddress?.state || "").trim(),
+        pincode: String(data.shippingAddress?.pincode || "").trim(),
+        country: (data.shippingAddress?.country || "India").trim(),
+      },
+      contacts: (data.contacts || []).map((c) => ({
+        id: String(c.id || ""),
+        name: (c.name || "").trim(),
+        designation: (c.designation || "").trim(),
+        email: (c.email || "").trim(),
+        phone: String(c.phone || "").trim(),
+      })),
+      branches: (data.branches || []).map((b) => ({
+        id: String(b.id || ""),
+        name: (b.name || "").trim(),
+        address: {
+          street1: (b.address?.street1 || "").trim(),
+          street2: (b.address?.street2 || "").trim(),
+          city: (b.address?.city || "").trim(),
+          state: (b.address?.state || "").trim(),
+          pincode: String(b.address?.pincode || "").trim(),
+          country: (b.address?.country || "India").trim(),
+        },
+        contacts: (b.contacts || []).map((bc) => ({
+          id: String(bc.id || ""),
+          name: (bc.name || "").trim(),
+          designation: (bc.designation || "").trim(),
+          email: (bc.email || "").trim(),
+          phone: String(bc.phone || "").trim(),
+        })),
+      })),
     }
-
-    const billingStr = serializeAddress(data.billingAddress)
-    const shippingStr = serializeAddress(data.shippingAddress)
-    const finalShippingSegment = `${shippingStr}|||${JSON.stringify(extra)}`
-
-    const payload = {
-      clientId: parseInt(id),
-      clientName: data.name ?? "",
-      billingAddress: billingStr,
-      shippingAddress: finalShippingSegment,
-      gstin: data.gstin ?? "",
-      contactPerson: data.contactPerson ?? data.name ?? "",
-      contactNumber: data.phone ?? "",
-    }
-    return apiClient.put<any>(`/api/Client/${id}`, payload)
+    return apiClient.post<any>("/api/Client/Create", payload)
   },
 
-  /** DELETE /api/Clients/{id} — delete a client */
-  remove: (id: string) => apiClient.delete<void>(`/api/Client/${id}`),
+  /** PUT /api/Client/Update/{id} — update an existing client */
+  update: (id: string | number, data: Partial<CreateClientPayload> | Partial<Client>) => {
+    const payload: CreateClientPayload = {
+      clientId: Number(id) || 0,
+      name: (data.name || "").trim(),
+      company: (data.company || data.name || "").trim(),
+      contactPerson: (data.contactPerson || data.name || "").trim(),
+      email: (data.email || "").trim(),
+      phone: (data.phone || "").trim(),
+      status: data.status || "Active",
+      clientType: data.clientType || "Clinic",
+      doctorSpeciality: (data.doctorSpeciality || "").trim(),
+      hasBranches: (data.branches && data.branches.length > 0) || Boolean(data.hasBranches),
+      gstin: (data.gstin || "").trim(),
+      joinedDate: data.joinedDate
+        ? (data.joinedDate.includes("T") ? data.joinedDate : new Date(data.joinedDate).toISOString())
+        : new Date().toISOString(),
+      instagramUrl: (data.instagramUrl || "").trim(),
+      dateOfBirth: data.dateOfBirth
+        ? (data.dateOfBirth.includes("T") ? data.dateOfBirth : new Date(data.dateOfBirth).toISOString())
+        : new Date().toISOString(),
+      billingAddress: {
+        street1: (data.billingAddress?.street1 || "").trim(),
+        street2: (data.billingAddress?.street2 || "").trim(),
+        city: (data.billingAddress?.city || "").trim(),
+        state: (data.billingAddress?.state || "").trim(),
+        pincode: String(data.billingAddress?.pincode || "").trim(),
+        country: (data.billingAddress?.country || "India").trim(),
+      },
+      shippingAddress: {
+        street1: (data.shippingAddress?.street1 || "").trim(),
+        street2: (data.shippingAddress?.street2 || "").trim(),
+        city: (data.shippingAddress?.city || "").trim(),
+        state: (data.shippingAddress?.state || "").trim(),
+        pincode: String(data.shippingAddress?.pincode || "").trim(),
+        country: (data.shippingAddress?.country || "India").trim(),
+      },
+      contacts: (data.contacts || []).map((c) => ({
+        id: String(c.id || ""),
+        name: (c.name || "").trim(),
+        designation: (c.designation || "").trim(),
+        email: (c.email || "").trim(),
+        phone: String(c.phone || "").trim(),
+      })),
+      branches: (data.branches || []).map((b) => ({
+        id: String(b.id || ""),
+        name: (b.name || "").trim(),
+        address: {
+          street1: (b.address?.street1 || "").trim(),
+          street2: (b.address?.street2 || "").trim(),
+          city: (b.address?.city || "").trim(),
+          state: (b.address?.state || "").trim(),
+          pincode: String(b.address?.pincode || "").trim(),
+          country: (b.address?.country || "India").trim(),
+        },
+        contacts: (b.contacts || []).map((bc) => ({
+          id: String(bc.id || ""),
+          name: (bc.name || "").trim(),
+          designation: (bc.designation || "").trim(),
+          email: (bc.email || "").trim(),
+          phone: String(bc.phone || "").trim(),
+        })),
+      })),
+    }
+    return apiClient.put<any>(`/api/Client/Update/${id}`, payload)
+  },
+
+  /** DELETE /api/Client/Delete/{id} — delete a client */
+  remove: (id: string | number) => apiClient.delete<void>(`/api/Client/Delete/${id}`),
 }
 
-// ---------------------------------------------------------------------------
-// Vendors  →  /api/Vendors
-// ---------------------------------------------------------------------------
+export interface ApiVendor {
+  vendorId?: number
+  id?: number | string
+  vendorName?: string
+  name?: string
+  address?: string
+  gstin?: string
+  email?: string
+  contactPersonName?: string
+  contactPerson?: string
+  mobileNumber?: string
+  phone?: string
+  status?: boolean | string
+  vendorPrefix?: string | null
+}
+
+export function mapApiVendor(raw: ApiVendor | any): Vendor {
+  if (!raw) return {} as Vendor
+  const vId = String(raw.vendorId ?? raw.id ?? 0)
+  const vName = raw.vendorName || raw.name || `Vendor #${vId}`
+  const contact = raw.contactPersonName || raw.contactPerson || ""
+  const mobile = raw.mobileNumber || raw.phone || ""
+  const prefix = raw.vendorPrefix ?? (raw as any).prefix ?? ""
+
+  return {
+    ...(raw as any),
+    id: vId,
+    vendorId: Number(vId) || undefined,
+    name: vName,
+    vendorName: vName,
+    contactPerson: contact,
+    contactPersonName: contact,
+    email: raw.email || "",
+    phone: mobile,
+    mobileNumber: mobile,
+    address: typeof raw.address === "string" ? raw.address : "",
+    gstin: raw.gstin || "",
+    status: raw.status === false || raw.status === "Inactive" ? "Inactive" : "Active",
+    vendorPrefix: prefix || "",
+    products: Array.isArray(raw.products) ? raw.products : [],
+    purchaseHistory: Array.isArray(raw.purchaseHistory) ? raw.purchaseHistory : [],
+    payments: Array.isArray(raw.payments) ? raw.payments : [],
+  }
+}
 
 export const vendorsApi = {
-  /** GET /api/Vendors — fetch all vendors */
-  getAll: () => apiClient.get<Vendor[]>("/api/Vendors"),
+  /** GET /api/Vendor — fetch all vendors with optional pagination & SearchTerm */
+  getAll: async (params?: { pageNumber?: number; pageSize?: number; searchTerm?: string }): Promise<Vendor[]> => {
+    try {
+      const q = new URLSearchParams()
+      if (params?.pageNumber) q.append("PageNumber", String(params.pageNumber))
+      if (params?.pageSize) q.append("PageSize", String(params.pageSize))
+      if (params?.searchTerm) q.append("SearchTerm", params.searchTerm)
 
-  /** GET /api/Vendors/{id} — fetch a single vendor */
-  getById: (id: string) => apiClient.get<Vendor>(`/api/Vendors/${id}`),
+      const endpoint = q.toString() ? `/api/Vendor?${q.toString()}` : "/api/Vendor"
+      const raw = await apiClient.get<any>(endpoint)
+      const list = Array.isArray(raw) ? raw : (raw?.data && Array.isArray(raw.data) ? raw.data : [])
+      return list.map(mapApiVendor)
+    } catch (err) {
+      console.error("Failed to fetch vendors:", err)
+      return []
+    }
+  },
 
-  /** POST /api/Vendors — create a new vendor */
-  create: (data: Omit<Vendor, "id" | "products" | "purchaseHistory" | "payments">) =>
-    apiClient.post<Vendor>("/api/Vendors", data),
+  /** GET /api/Vendor with pagination and metadata */
+  getPaged: async (params?: { pageNumber?: number; pageSize?: number; searchTerm?: string }): Promise<{ vendors: Vendor[]; totalCount: number }> => {
+    try {
+      const q = new URLSearchParams()
+      if (params?.pageNumber) q.append("PageNumber", String(params.pageNumber))
+      if (params?.pageSize) q.append("PageSize", String(params.pageSize))
+      if (params?.searchTerm) q.append("SearchTerm", params.searchTerm)
 
-  /** PUT /api/Vendors/{id} — update an existing vendor */
-  update: (id: string, data: Partial<Omit<Vendor, "id">>) =>
-    apiClient.put<Vendor>(`/api/Vendors/${id}`, data),
+      const endpoint = q.toString() ? `/api/Vendor?${q.toString()}` : "/api/Vendor"
+      const raw = await apiClient.get<any>(endpoint)
+      const list = Array.isArray(raw) ? raw : (raw?.data && Array.isArray(raw.data) ? raw.data : [])
+      const totalCount = typeof raw?.totalCount === "number" ? raw.totalCount : list.length
+      return {
+        vendors: list.map(mapApiVendor),
+        totalCount
+      }
+    } catch (err) {
+      console.error("Failed to fetch paged vendors:", err)
+      return { vendors: [], totalCount: 0 }
+    }
+  },
 
-  /** DELETE /api/Vendors/{id} — delete a vendor */
-  remove: (id: string) => apiClient.delete<void>(`/api/Vendors/${id}`),
+  /** GET /api/Vendor/{id} */
+  getById: async (id: string | number): Promise<Vendor> => {
+    try {
+      const raw = await apiClient.get<any>(`/api/Vendor/${id}`)
+      const data = raw?.data !== undefined ? raw.data : raw
+      if (data && typeof data === "object") {
+        return mapApiVendor(data)
+      }
+      throw new Error(`Vendor with id ${id} not found in response`)
+    } catch {
+      // Fallback: try finding in getAll()
+      const all = await vendorsApi.getAll()
+      const found = all.find(
+        (v: any) => String(v.id) === String(id) || String(v.vendorId) === String(id)
+      )
+      if (found) return found
+      throw new Error(`Vendor with id ${id} not found`)
+    }
+  },
+
+  /** POST /api/Vendor */
+  create: (data: Partial<Vendor> | CreateVendorDto | any) => {
+    const payload: CreateVendorDto = {
+      vendorId: 0,
+      vendorName: (data.vendorName || data.name || "").trim(),
+      address: typeof data.address === "string" ? data.address.trim() : "",
+      gstin: (data.gstin || "").trim(),
+      email: (data.email || "").trim(),
+      mobileNumber: (data.mobileNumber || data.phone || "").trim(),
+      contactPersonName: (data.contactPersonName || data.contactPerson || "").trim(),
+      vendorPrefix: data.vendorPrefix ? data.vendorPrefix.trim() : "",
+    }
+    return apiClient.post<any>("/api/Vendor", payload)
+  },
+
+  /** PUT /api/Vendor/{id} */
+  update: (id: string | number, data: Partial<Vendor> | CreateVendorDto | any) => {
+    const vId = Number(id) || Number(data.vendorId) || 0
+    const payload: CreateVendorDto = {
+      vendorId: vId,
+      vendorName: (data.vendorName || data.name || "").trim(),
+      address: typeof data.address === "string" ? data.address.trim() : "",
+      gstin: (data.gstin || "").trim(),
+      email: (data.email || "").trim(),
+      mobileNumber: (data.mobileNumber || data.phone || "").trim(),
+      contactPersonName: (data.contactPersonName || data.contactPerson || "").trim(),
+      vendorPrefix: data.vendorPrefix ? data.vendorPrefix.trim() : "",
+    }
+    return apiClient.put<any>(`/api/Vendor/${id}`, payload)
+  },
+
+  /** DELETE /api/Vendor/{id} */
+  remove: (id: string | number) => apiClient.delete<void>(`/api/Vendor/${id}`),
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +475,51 @@ export const vendorsApi = {
 // ---------------------------------------------------------------------------
 // TODO: import Product type from inventory module once types are defined
 
-export const productsApi = {
-  /** GET /api/Products */
-  getAll: () => apiClient.get<unknown[]>("/api/Products"),
+export interface GenerateVariantBarcodeDto {
+  categoryPath: number[]
+  tempProdId?: string
+  index?: number
+  variantCount?: number
+}
 
-  /** GET /api/Products/{id} */
-  getById: (id: string) => apiClient.get<unknown>(`/api/Products/${id}`),
+export interface GenerateVariantBarcodeQueryParams {
+  rootCategoryId?: number | string
+  subcategoryId?: number | string
+  productId?: number | string
+  variantIndex?: number | string
+}
+
+export interface VariantBarcodeSegments {
+  rootCategoryId: string
+  subcategoryId: string
+  productId: string
+  variantIndex: string
+}
+
+export interface VariantBarcodeData {
+  barcode: string
+  barcodes: string[]
+  segments: VariantBarcodeSegments
+}
+
+export interface GenerateVariantBarcodeResponse {
+  statusCode: number
+  success: boolean
+  message: string
+  data: VariantBarcodeData
+  totalCount?: number | null
+  error?: string | null
+}
+
+export const productsApi = {
+  /** GET /api/Product/GetAll */
+  getAll: () => apiClient.get<any>("/api/Product/GetAll"),
+
+  /** GET /api/Product/GetById/{id} */
+  getById: (id: string | number) => apiClient.get<any>(`/api/Product/GetById/${id}`),
+
+  /** GET /api/Product/SalesDetails/{id} */
+  getSalesDetails: (id: string | number) => apiClient.get<any>(`/api/Product/SalesDetails/${id}`),
 
   /** POST /api/Product/Create */
   create: (data: any) => apiClient.post<any>("/api/Product/Create", data),
@@ -234,6 +530,20 @@ export const productsApi = {
 
   /** DELETE /api/Products/{id} */
   remove: (id: string) => apiClient.delete<void>(`/api/Products/${id}`),
+
+  /** POST /api/Product/GenerateVariantBarcode */
+  generateVariantBarcode: (dto: GenerateVariantBarcodeDto) =>
+    apiClient.post<GenerateVariantBarcodeResponse>("/api/Product/GenerateVariantBarcode", dto),
+
+  /** GET /api/Product/GenerateVariantBarcode */
+  getVariantBarcode: (params: GenerateVariantBarcodeQueryParams) => {
+    const q = new URLSearchParams()
+    if (params.rootCategoryId !== undefined) q.append("rootCategoryId", String(params.rootCategoryId))
+    if (params.subcategoryId !== undefined) q.append("subcategoryId", String(params.subcategoryId))
+    if (params.productId !== undefined) q.append("productId", String(params.productId))
+    if (params.variantIndex !== undefined) q.append("variantIndex", String(params.variantIndex))
+    return apiClient.get<GenerateVariantBarcodeResponse>(`/api/Product/GenerateVariantBarcode?${q.toString()}`)
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -241,34 +551,56 @@ export const productsApi = {
 // ---------------------------------------------------------------------------
 
 export function mapApiWarehouse(raw: ApiWarehouse): Warehouse {
-  const address = typeof raw.address === "string" ? raw.address : ""
-  const [addressRaw, racksRaw] = address.split("|||")
-  const addressParts = (addressRaw || "").split("|")
-
-  let racks: any[] = []
-  try {
-    if (racksRaw) {
-      racks = JSON.parse(racksRaw)
-    }
-  } catch (e) {
-    console.error("Failed to parse racks data:", e)
+  let addrObj = {
+    street: "",
+    city: "",
+    state: "",
+    pincode: "",
+    country: "India",
   }
+  let racks: Rack[] = []
 
-  return {
-    id: String(raw.warehouseId),
-    name: raw.warehouseName,
-    address: {
+  if (raw.address && typeof raw.address === "object") {
+    const addr = raw.address as any
+    addrObj = {
+      street: addr.street || "",
+      city: addr.city || "",
+      state: addr.state || "",
+      pincode: addr.pincode || "",
+      country: addr.country || "India",
+    }
+    racks = Array.isArray(raw.racks) ? raw.racks : []
+  } else if (typeof raw.address === "string") {
+    const address = raw.address as string
+    const [addressRaw, racksRaw] = address.split("|||")
+    const addressParts = (addressRaw || "").split("|")
+    addrObj = {
       street: addressParts[0] || "",
       city: addressParts[1] || "",
       state: addressParts[2] || "",
       pincode: addressParts[3] || "",
       country: addressParts[4] || "India",
-    },
-    contactPerson: raw.contactPerson,
-    contactNumber: raw.contactNumber,
+    }
+    try {
+      if (racksRaw) {
+        racks = JSON.parse(racksRaw)
+      }
+    } catch (e) {
+      console.error("Failed to parse racks data:", e)
+    }
+  }
+
+  return {
+    id: String(raw.warehouseId ?? (raw as any).id ?? 0),
+    warehouseId: raw.warehouseId ?? Number((raw as any).id) ?? 0,
+    name: raw.warehouseName || (raw as any).name || "",
+    warehouseName: raw.warehouseName || (raw as any).name || "",
+    address: addrObj,
+    contactPerson: raw.contactPerson || "",
+    contactNumber: raw.contactNumber || "",
     status: raw.status ? "Active" : "Inactive",
     racks: racks,
-  }
+  } as any
 }
 
 export const warehousesApi = {
@@ -276,7 +608,7 @@ export const warehousesApi = {
   getAll: async (): Promise<Warehouse[]> => {
     try {
       const raw = await apiClient.get<any>("/api/Warehouse")
-      // Handle different API response formats
+      // Handle response envelope { statusCode: 200, data: [...] }
       const list = Array.isArray(raw) ? raw : (raw?.data && Array.isArray(raw.data) ? raw.data : [])
       return list.map(mapApiWarehouse)
     } catch (err) {
@@ -287,48 +619,47 @@ export const warehousesApi = {
 
   /** GET /api/Warehouse/{id} */
   getById: async (id: string): Promise<Warehouse> => {
-    const raw = await apiClient.get<ApiWarehouse>(`/api/Warehouse/GetById/${id}`)
-    return mapApiWarehouse(raw)
+    const raw = await apiClient.get<any>(`/api/Warehouse/GetById/${id}`)
+    const data = raw?.data || raw
+    return mapApiWarehouse(data)
   },
 
   /** POST /api/Warehouse */
   create: (data: Partial<Warehouse>) => {
-    const addr = data.address
-    const serializedAddress = addr
-      ? `${addr.street}|${addr.city}|${addr.state}|${addr.pincode}|${addr.country}`
-      : ""
-
-    const racksJson = data.racks ? JSON.stringify(data.racks) : "[]"
-    const finalAddress = `${serializedAddress}|||${racksJson}`
-
     const payload = {
       warehouseId: 0,
-      warehouseName: data.name,
-      address: finalAddress,
-      contactPerson: data.contactPerson,
-      contactNumber: data.contactNumber,
+      warehouseName: data.name ?? "",
+      address: {
+        street: data.address?.street ?? "",
+        city: data.address?.city ?? "",
+        state: data.address?.state ?? "",
+        pincode: data.address?.pincode ?? "",
+        country: data.address?.country ?? "India",
+      },
+      contactPerson: data.contactPerson ?? "",
+      contactNumber: data.contactNumber ?? "",
       status: data.status === "Active",
+      racks: data.racks ?? [],
     }
     return apiClient.post<any>("/api/Warehouse", payload)
   },
 
   /** PUT /api/Warehouse/{id} */
   update: (id: string, data: Partial<Warehouse>) => {
-    const addr = data.address
-    const serializedAddress = addr
-      ? `${addr.street}|${addr.city}|${addr.state}|${addr.pincode}|${addr.country}`
-      : ""
-
-    const racksJson = data.racks ? JSON.stringify(data.racks) : "[]"
-    const finalAddress = `${serializedAddress}|||${racksJson}`
-
     const payload = {
       warehouseId: parseInt(id),
-      warehouseName: data.name,
-      address: finalAddress,
-      contactPerson: data.contactPerson,
-      contactNumber: data.contactNumber,
+      warehouseName: data.name ?? "",
+      address: {
+        street: data.address?.street ?? "",
+        city: data.address?.city ?? "",
+        state: data.address?.state ?? "",
+        pincode: data.address?.pincode ?? "",
+        country: data.address?.country ?? "India",
+      },
+      contactPerson: data.contactPerson ?? "",
+      contactNumber: data.contactNumber ?? "",
       status: data.status === "Active",
+      racks: data.racks ?? [],
     }
     return apiClient.put<any>(`/api/Warehouse/${id}`, payload)
   },
@@ -345,16 +676,79 @@ import { mapApiQuotation, Quotation } from "@/app/sales/quotations/types"
 import { mapApiProforma, ProformaInvoice } from "@/app/sales/proforma-invoices/types"
 import type { SalesDocument } from "@/app/sales/types"
 
+export interface QuotationGetAllParams {
+  PageNumber?: number
+  PageSize?: number
+  SearchTerm?: string
+  Status?: string
+  StartDate?: string
+  EndDate?: string
+  SalesPersonId?: number | string
+}
+
 export const quotationsApi = {
-  /** GET /api/Quotation/GetAll — fetch all quotations */
-  getAll: async (): Promise<Quotation[]> => {
+  /** GET /api/Quotation/GetAll — supports PageNumber, PageSize, SearchTerm, Status, StartDate, EndDate, SalesPersonId */
+  getAll: async (params?: QuotationGetAllParams): Promise<{ data: Quotation[]; totalCount: number } | Quotation[]> => {
     try {
-      const raw = await apiClient.get<any>("/api/Quotation/GetAll")
-      if (Array.isArray(raw)) return raw.map(mapApiQuotation)
-      if (raw?.data && Array.isArray(raw.data)) return raw.data.map(mapApiQuotation)
-      return []
+      const query = new URLSearchParams()
+      if (params?.PageNumber) query.append("PageNumber", String(params.PageNumber))
+      if (params?.PageSize) query.append("PageSize", String(params.PageSize))
+      if (params?.SearchTerm && params.SearchTerm.trim()) query.append("SearchTerm", params.SearchTerm.trim())
+      if (params?.SalesPersonId && String(params.SalesPersonId).trim() !== "0" && String(params.SalesPersonId).trim() !== "all") {
+        query.append("SalesPersonId", String(params.SalesPersonId).trim())
+      }
+      if (params?.Status && params.Status.toLowerCase() !== "all") {
+        query.append("Status", params.Status)
+      }
+      if (params?.StartDate) {
+        const startIso = params.StartDate.includes("T")
+          ? params.StartDate
+          : new Date(params.StartDate + "T00:00:00.000Z").toISOString()
+        query.append("StartDate", startIso)
+      }
+      if (params?.EndDate) {
+        const endIso = params.EndDate.includes("T")
+          ? params.EndDate
+          : new Date(params.EndDate + "T23:59:59.999Z").toISOString()
+        query.append("EndDate", endIso)
+      }
+
+      const queryString = query.toString() ? `?${query.toString()}` : ""
+      const raw = await apiClient.get<any>(`/api/Quotation/GetAll${queryString}`)
+
+      let list: any[] = []
+      let total = 0
+
+      if (Array.isArray(raw)) {
+        list = raw
+        total = raw.length
+      } else if (raw?.data && Array.isArray(raw.data)) {
+        list = raw.data
+        total = raw.totalCount ?? raw.total ?? raw.totalRecords ?? list.length
+      } else if (raw?.items && Array.isArray(raw.items)) {
+        list = raw.items
+        total = raw.totalCount ?? raw.total ?? raw.totalRecords ?? list.length
+      }
+
+      const mapped = list.map(mapApiQuotation)
+      if (params) {
+        return { data: mapped, totalCount: total }
+      }
+      return mapped
     } catch (err) {
       console.error("Failed to fetch quotations:", err)
+      return params ? { data: [], totalCount: 0 } : []
+    }
+  },
+
+  /** GET /api/Quotation/BySalesPerson/{salesPersonId} */
+  getBySalesPerson: async (salesPersonId: string | number): Promise<Quotation[]> => {
+    try {
+      const raw = await apiClient.get<any>(`/api/Quotation/BySalesPerson/${salesPersonId}`)
+      const list = Array.isArray(raw) ? raw : (raw?.data || raw?.items || [])
+      return list.map(mapApiQuotation)
+    } catch (err) {
+      console.error(`Failed to fetch quotations by salesPersonId ${salesPersonId}:`, err)
       return []
     }
   },
@@ -372,6 +766,17 @@ export const quotationsApi = {
   /** PUT /api/Quotation/Update/{id} */
   update: (id: string, data: any) => apiClient.put<any>(`/api/Quotation/Update/${id}`, data),
 
+  /** PUT /api/Quotation/{id}/Status */
+  updateStatus: (id: string | number, newStatus: string, remarks?: string) =>
+    apiClient.put<any>(`/api/Quotation/${id}/Status`, { newStatus, remarks: remarks || "" }),
+
+  /** POST /api/Quotation/{id}/SendEmail */
+  sendEmail: (id: string | number) => apiClient.post<any>(`/api/Quotation/${id}/SendEmail`),
+
+  /** POST /api/Quotation/ConvertToSalesOrder/{id} */
+  convertToSalesOrder: (id: string | number, data?: any) =>
+    apiClient.post<any>(`/api/Quotation/ConvertToSalesOrder/${id}`, data || {}),
+
   /** DELETE /api/Quotation/Delete/{id} */
   remove: (id: string) => apiClient.delete<void>(`/api/Quotation/Delete/${id}`),
 }
@@ -380,16 +785,83 @@ export const quotationsApi = {
 // Proforma Invoices  →  /api/ProformaInvoice
 // ---------------------------------------------------------------------------
 
+export interface ProformaGetAllParams {
+  PageNumber?: number
+  PageSize?: number
+  SearchTerm?: string
+  ClientId?: number | string
+  Status?: string
+  StartDate?: string
+  EndDate?: string
+  SalesPersonId?: number | string
+}
+
 export const proformaApi = {
-  /** GET /api/ProformaInvoice/GetAll */
-  getAll: async (): Promise<ProformaInvoice[]> => {
+  /** GET /api/ProformaInvoice/GetAll — supports PageNumber, PageSize, SearchTerm, ClientId, Status, StartDate, EndDate, SalesPersonId */
+  getAll: async (params?: ProformaGetAllParams): Promise<{ data: ProformaInvoice[]; totalCount: number } | ProformaInvoice[]> => {
     try {
-      const raw = await apiClient.get<any>("/api/ProformaInvoice/GetAll")
-      if (Array.isArray(raw)) return raw.map(mapApiProforma)
-      if (raw?.data && Array.isArray(raw.data)) return raw.data.map(mapApiProforma)
-      return []
+      const query = new URLSearchParams()
+      if (params?.PageNumber) query.append("PageNumber", String(params.PageNumber))
+      if (params?.PageSize) query.append("PageSize", String(params.PageSize))
+      if (params?.SearchTerm && params.SearchTerm.trim()) query.append("SearchTerm", params.SearchTerm.trim())
+      if (params?.ClientId && String(params.ClientId).trim() !== "all" && String(params.ClientId).trim() !== "0") {
+        query.append("ClientId", String(params.ClientId).trim())
+      }
+      if (params?.SalesPersonId && String(params.SalesPersonId).trim() !== "0" && String(params.SalesPersonId).trim() !== "all") {
+        query.append("SalesPersonId", String(params.SalesPersonId).trim())
+      }
+      if (params?.Status && params.Status.toLowerCase() !== "all") {
+        query.append("Status", params.Status)
+      }
+      if (params?.StartDate) {
+        const startIso = params.StartDate.includes("T")
+          ? params.StartDate
+          : new Date(params.StartDate + "T00:00:00.000Z").toISOString()
+        query.append("StartDate", startIso)
+      }
+      if (params?.EndDate) {
+        const endIso = params.EndDate.includes("T")
+          ? params.EndDate
+          : new Date(params.EndDate + "T23:59:59.999Z").toISOString()
+        query.append("EndDate", endIso)
+      }
+
+      const queryString = query.toString() ? `?${query.toString()}` : ""
+      const raw = await apiClient.get<any>(`/api/ProformaInvoice/GetAll${queryString}`)
+
+      let list: any[] = []
+      let total = 0
+
+      if (Array.isArray(raw)) {
+        list = raw
+        total = raw.length
+      } else if (raw?.data && Array.isArray(raw.data)) {
+        list = raw.data
+        total = raw.totalCount ?? raw.total ?? raw.totalRecords ?? list.length
+      } else if (raw?.items && Array.isArray(raw.items)) {
+        list = raw.items
+        total = raw.totalCount ?? raw.total ?? raw.totalRecords ?? list.length
+      }
+
+      const mapped = list.map(mapApiProforma)
+      if (params) {
+        return { data: mapped, totalCount: total }
+      }
+      return mapped
     } catch (err) {
       console.error("Failed to fetch proforma invoices:", err)
+      return params ? { data: [], totalCount: 0 } : []
+    }
+  },
+
+  /** GET /api/ProformaInvoice/BySalesPerson/{salesPersonId} */
+  getBySalesPerson: async (salesPersonId: string | number): Promise<ProformaInvoice[]> => {
+    try {
+      const raw = await apiClient.get<any>(`/api/ProformaInvoice/BySalesPerson/${salesPersonId}`)
+      const list = Array.isArray(raw) ? raw : (raw?.data || raw?.items || [])
+      return list.map(mapApiProforma)
+    } catch (err) {
+      console.error(`Failed to fetch proformas by salesPersonId ${salesPersonId}:`, err)
       return []
     }
   },
@@ -409,6 +881,35 @@ export const proformaApi = {
 
   /** DELETE /api/ProformaInvoice/Delete/{id} */
   remove: (id: string) => apiClient.delete<void>(`/api/ProformaInvoice/Delete/${id}`),
+
+  /** POST /api/ProformaInvoice/{id}/ConvertToSalesOrder */
+  convertToSalesOrder: (id: string | number, data: {
+    clientId: number
+    salesPersonId: number
+    targetDeliveryDate: string
+    orderNotes: string
+    [key: string]: any
+  }) => {
+    const cId = Number(data.clientId) || 0
+    const spId = Number(data.salesPersonId) || 0
+    return apiClient.post<any>(`/api/ProformaInvoice/${id}/ConvertToSalesOrder`, {
+      clientId: cId,
+      ClientId: cId,
+      salesPersonId: spId,
+      SalesPersonId: spId,
+      targetDeliveryDate: data.targetDeliveryDate || new Date().toISOString(),
+      TargetDeliveryDate: data.targetDeliveryDate || new Date().toISOString(),
+      orderNotes: data.orderNotes || "",
+      OrderNotes: data.orderNotes || "",
+    })
+  },
+
+  /** PUT /api/ProformaInvoice/{id}/Status */
+  updateStatus: (id: string | number, newStatus: string, remarks?: string) =>
+    apiClient.put<any>(`/api/ProformaInvoice/${id}/Status`, { newStatus, remarks: remarks || "" }),
+
+  /** POST /api/ProformaInvoice/{id}/SendEmail */
+  sendEmail: (id: string | number) => apiClient.post<any>(`/api/ProformaInvoice/${id}/SendEmail`),
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +963,7 @@ export const categoriesApi = {
 
 export const authApi = {
   /** POST /api/Auth/login */
-  login: (credentials: { username: string; password: string }) => 
+  login: (credentials: { username: string; password: string }) =>
     apiClient.post<any>("/api/Auth/login", credentials),
 }
 
@@ -482,8 +983,16 @@ export const systemMastersApi = {
 }
 
 // ---------------------------------------------------------------------------
-// Sales Orders  →  /api/SalesOrder
-// ---------------------------------------------------------------------------
+export interface SalesOrderGetAllParams {
+  PageNumber?: number
+  PageSize?: number
+  SearchTerm?: string
+  ClientId?: number | string
+  Status?: string
+  StartDate?: string
+  EndDate?: string
+  SalesPersonId?: number | string
+}
 
 export const salesOrderApi = {
   /** POST /api/SalesOrder/Create */
@@ -492,8 +1001,41 @@ export const salesOrderApi = {
   /** PUT /api/SalesOrder/Update/{id} */
   update: (id: string, data: any) => apiClient.put<any>(`/api/SalesOrder/Update/${id}`, data),
 
-  /** GET /api/SalesOrder/GetAll */
-  getAll: () => apiClient.get<any[]>("/api/SalesOrder/GetAll"),
+  /** PUT /api/SalesOrder/{id}/Status */
+  updateStatus: (id: string | number, newStatus: string, remarks?: string) =>
+    apiClient.put<any>(`/api/SalesOrder/${id}/Status`, { newStatus, remarks: remarks || "" }),
+
+  /** GET /api/SalesOrder/GetAll — supports PageNumber, PageSize, SearchTerm, ClientId, Status, StartDate, EndDate, SalesPersonId */
+  getAll: (params?: SalesOrderGetAllParams) => {
+    const query = new URLSearchParams()
+    if (params?.PageNumber) query.append("PageNumber", String(params.PageNumber))
+    if (params?.PageSize) query.append("PageSize", String(params.PageSize))
+    if (params?.SearchTerm && params.SearchTerm.trim()) query.append("SearchTerm", params.SearchTerm.trim())
+    if (params?.ClientId && String(params.ClientId) !== "0" && String(params.ClientId) !== "all") {
+      query.append("ClientId", String(params.ClientId))
+    }
+    if (params?.SalesPersonId && String(params.SalesPersonId).trim() !== "0" && String(params.SalesPersonId).trim() !== "all") {
+      query.append("SalesPersonId", String(params.SalesPersonId).trim())
+    }
+    if (params?.Status && params.Status.toLowerCase() !== "all") {
+      query.append("Status", params.Status)
+    }
+    if (params?.StartDate) {
+      const startIso = params.StartDate.includes("T") ? params.StartDate : new Date(params.StartDate + "T00:00:00.000Z").toISOString()
+      query.append("StartDate", startIso)
+    }
+    if (params?.EndDate) {
+      const endIso = params.EndDate.includes("T") ? params.EndDate : new Date(params.EndDate + "T23:59:59.999Z").toISOString()
+      query.append("EndDate", endIso)
+    }
+
+    const queryString = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<any>(`/api/SalesOrder/GetAll${queryString}`)
+  },
+
+  /** GET /api/SalesOrder/BySalesPerson/{salesPersonId} */
+  getBySalesPerson: (salesPersonId: string | number) =>
+    apiClient.get<any>(`/api/SalesOrder/BySalesPerson/${salesPersonId}`),
 
   /** GET /api/SalesOrder/GetById/{id} */
   getById: (id: string) => apiClient.get<any>(`/api/SalesOrder/GetById/${id}`),
@@ -517,4 +1059,1255 @@ export const dashboardApi = {
   getTopClients: () => apiClient.get<any>("/api/Dashboard/TopClients"),
   getCriticalStock: () => apiClient.get<any>("/api/Dashboard/CriticalStock"),
 }
+
+// ---------------------------------------------------------------------------
+// Sales Dashboard & Advanced Intelligence  →  /api/SalesDashboard
+// ---------------------------------------------------------------------------
+
+export interface SalesDashboardKPIs {
+  revenueThisMonth: number
+  revenueThisYear: number
+  activeOrders: number
+  quotationsSentThisMonth: number
+  proformaThisMonth: number
+  conversionRatePct: number
+  avgOrderValue: number
+  creditNotesCount: number
+  creditNotesRefundAmount: number
+}
+
+export interface HistoricalTrendItem {
+  year: number
+  month: number
+  monthName: string
+  totalOrders: number
+  totalRevenue: number
+  avgOrderValue: number
+}
+
+export interface PipelineFunnelItem {
+  documentType: string
+  stage: string
+  documentCount: number
+  totalValue: number
+}
+
+export interface ForecastItem {
+  forecastMonth: string
+  year: number
+  month: number
+  estimatedRevenue: number
+  lowerBound: number
+  upperBound: number
+  confidenceLabel: string
+}
+
+export interface ForecastResponse {
+  lookbackMonths: number
+  forecastMonths: number
+  historicalData: HistoricalTrendItem[]
+  forecast: ForecastItem[]
+}
+
+export interface TopSalesPersonItem {
+  salesPersonId: number
+  salesPersonName: string
+  totalOrders: number
+  totalRevenue: number
+  avgOrderValue: number
+  totalQuantitySold: number
+}
+
+export interface TopClientItem {
+  clientId: number
+  clientName: string
+  totalOrders: number
+  totalRevenue: number
+  avgOrderValue: number
+  lastOrderDate: string
+}
+
+export interface TopProductItem {
+  productId: number
+  productName: string
+  categoryName: string
+  totalQuantity: number
+  totalRevenue: number
+  avgUnitPrice: number
+}
+
+export interface SalesVsTargetItem {
+  year: number
+  month: number
+  monthName: string
+  actualRevenue: number
+  targetAmount: number
+  achievementPct: number
+  gap: number
+}
+
+export interface SalesRecordItem {
+  orderId: number
+  orderNumber: string
+  orderDate: string
+  clientId: number
+  clientName: string
+  salesPersonId: number
+  salesPersonName: string
+  productId: number
+  productName: string
+  categoryId: number
+  categoryName: string
+  quantity: number
+  unitPrice: number
+  totalPrice: number
+  orderStatus: string
+}
+
+export interface SalesRecordsParams {
+  startDate?: string
+  endDate?: string
+  productId?: number | string
+  categoryId?: number | string
+  salesPersonId?: number | string
+  clientId?: number | string
+  status?: string
+  pageNumber?: number
+  pageSize?: number
+}
+
+export interface SalesDashboardApiResponse<T> {
+  statusCode: number
+  success: boolean
+  message: string
+  data: T
+  totalCount?: number
+  error?: any
+}
+
+export const salesDashboardApi = {
+  /** GET /api/SalesDashboard/KPIs */
+  getKPIs: () => apiClient.get<SalesDashboardApiResponse<SalesDashboardKPIs>>("/api/SalesDashboard/KPIs"),
+
+  /** GET /api/SalesDashboard/HistoricalTrend */
+  getHistoricalTrend: (lookbackMonths: number = 12) =>
+    apiClient.get<SalesDashboardApiResponse<HistoricalTrendItem[]>>(`/api/SalesDashboard/HistoricalTrend?lookbackMonths=${lookbackMonths}`),
+
+  /** GET /api/SalesDashboard/PipelineFunnel */
+  getPipelineFunnel: () => apiClient.get<SalesDashboardApiResponse<PipelineFunnelItem[]>>("/api/SalesDashboard/PipelineFunnel"),
+
+  /** GET /api/SalesDashboard/Forecast */
+  getForecast: (lookbackMonths: number = 6, forecastMonths: number = 3) =>
+    apiClient.get<SalesDashboardApiResponse<ForecastResponse>>(`/api/SalesDashboard/Forecast?lookbackMonths=${lookbackMonths}&forecastMonths=${forecastMonths}`),
+
+  /** GET /api/SalesDashboard/TopSalesPersons */
+  getTopSalesPersons: (params?: { startDate?: string; endDate?: string; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.startDate) q.append("startDate", params.startDate)
+    if (params?.endDate) q.append("endDate", params.endDate)
+    if (params?.limit) q.append("limit", String(params.limit))
+    const qs = q.toString() ? `?${q.toString()}` : ""
+    return apiClient.get<SalesDashboardApiResponse<TopSalesPersonItem[]>>(`/api/SalesDashboard/TopSalesPersons${qs}`)
+  },
+
+  /** GET /api/SalesDashboard/TopClients */
+  getTopClients: (params?: { startDate?: string; endDate?: string; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.startDate) q.append("startDate", params.startDate)
+    if (params?.endDate) q.append("endDate", params.endDate)
+    if (params?.limit) q.append("limit", String(params.limit))
+    const qs = q.toString() ? `?${q.toString()}` : ""
+    return apiClient.get<SalesDashboardApiResponse<TopClientItem[]>>(`/api/SalesDashboard/TopClients${qs}`)
+  },
+
+  /** GET /api/SalesDashboard/TopProducts */
+  getTopProducts: (params?: { startDate?: string; endDate?: string; limit?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.startDate) q.append("startDate", params.startDate)
+    if (params?.endDate) q.append("endDate", params.endDate)
+    if (params?.limit) q.append("limit", String(params.limit))
+    const qs = q.toString() ? `?${q.toString()}` : ""
+    return apiClient.get<SalesDashboardApiResponse<TopProductItem[]>>(`/api/SalesDashboard/TopProducts${qs}`)
+  },
+
+  /** GET /api/SalesDashboard/VsTarget */
+  getVsTarget: (params?: { startDate?: string; endDate?: string; salesPersonId?: number | string }) => {
+    const q = new URLSearchParams()
+    if (params?.startDate) q.append("startDate", params.startDate)
+    if (params?.endDate) q.append("endDate", params.endDate)
+    if (params?.salesPersonId && String(params.salesPersonId) !== "0" && String(params.salesPersonId) !== "all") {
+      q.append("salesPersonId", String(params.salesPersonId))
+    }
+    const qs = q.toString() ? `?${q.toString()}` : ""
+    return apiClient.get<SalesDashboardApiResponse<SalesVsTargetItem[]>>(`/api/SalesDashboard/VsTarget${qs}`)
+  },
+
+  /** GET /api/SalesDashboard/SalesRecords */
+  getSalesRecords: (params?: SalesRecordsParams) => {
+    const q = new URLSearchParams()
+    if (params?.startDate) q.append("startDate", params.startDate)
+    if (params?.endDate) q.append("endDate", params.endDate)
+    if (params?.productId) q.append("productId", String(params.productId))
+    if (params?.categoryId) q.append("categoryId", String(params.categoryId))
+    if (params?.salesPersonId) q.append("salesPersonId", String(params.salesPersonId))
+    if (params?.clientId) q.append("clientId", String(params.clientId))
+    if (params?.status && params.status !== "all") q.append("status", params.status)
+    if (params?.pageNumber) q.append("pageNumber", String(params.pageNumber))
+    if (params?.pageSize) q.append("pageSize", String(params.pageSize))
+    const qs = q.toString() ? `?${q.toString()}` : ""
+    return apiClient.get<SalesDashboardApiResponse<SalesRecordItem[]>>(`/api/SalesDashboard/SalesRecords${qs}`)
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Order Outward  →  /api/OrderOutward
+// ---------------------------------------------------------------------------
+
+export interface ApiOutwardOrderItem {
+  outwardOrderItemId: number
+  outwardOrderId: number
+  productId: number
+  variantId?: number
+  productName: string
+  variantName: string
+  sku: string
+  barcode: string
+  orderedQty: number
+  scannedQty: number
+  locationCode: string
+  lotId?: number | null
+  lotNumber?: string | null
+}
+
+export interface ApiOutwardScanEvent {
+  scanId: number
+  outwardOrderId: number
+  barcode: string
+  message: string
+  scanType: string
+  productName?: string
+  scannedAt: string
+}
+
+export interface OutwardScanRequest {
+  barcode: string
+}
+
+export interface OutwardScanResultDto {
+  lotNumber: string
+  lotId: number | null
+  barcode: string
+  outwardOrderItemId: number
+  productId: number
+  variantId: number
+  productName: string
+  variantName: string
+  sku: string
+  orderedQty: number
+  scannedQty: number
+  locationCode: string | null
+  isItemComplete: boolean
+  isOrderComplete: boolean
+}
+
+export interface ApiOutwardOrder {
+  outwardOrderId: number
+  orderId: number
+  orderNumber: string
+  clientName: string
+  warehouseId?: number
+  warehouseName: string
+  warehouseCode?: string
+  shippingAddress: string
+  orderDate: string
+  promisedDate: string
+  status: string
+  priority: string
+  pickerName?: string
+  freight?: number
+  createdAt: string
+  updatedAt: string
+  items: ApiOutwardOrderItem[]
+  scanHistory: ApiOutwardScanEvent[]
+}
+
+export const orderOutwardApi = {
+  getAll: () => apiClient.get<ApiOutwardOrder[]>("/api/OrderOutward/GetAll"),
+  getById: (id: number | string) => apiClient.get<ApiOutwardOrder>(`/api/OrderOutward/GetById/${id}`),
+  create: (data: Partial<ApiOutwardOrder>) => apiClient.post<any>("/api/OrderOutward/Create", data),
+  update: (id: number | string, data: ApiOutwardOrder) => apiClient.put<any>(`/api/OrderOutward/Update/${id}`, data),
+  updateStatus: (id: number | string, newStatus: string, remarks: string) =>
+    apiClient.put<void>(`/api/OrderOutward/${id}/Status`, { newStatus, remarks }),
+  scanBarcode: (id: number | string, data: OutwardScanRequest | { barcode: string }) =>
+    apiClient.post<any>(`/api/OrderOutward/${id}/Scan`, data),
+  remove: (id: number | string) => apiClient.delete<void>(`/api/OrderOutward/Delete/${id}`),
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch  →  /api/Dispatch
+// ---------------------------------------------------------------------------
+
+export interface ApiDispatchItem {
+  dispatchItemId: number
+  dispatchId: number
+  productName: string
+  sku: string
+  quantity: number
+}
+
+export interface ApiDispatchTimelineEvent {
+  timelineId: number
+  dispatchId: number
+  label: string
+  description: string
+  timestamp: string
+  status: string
+}
+
+export interface ApiDispatch {
+  dispatchId: number
+  orderId: number
+  orderNumber: string
+  clientName: string
+  clientCity?: string
+  warehouseName: string
+  warehouseCode: string
+  shippingAddress: string
+  packedAt?: string
+  partnerName: string
+  partnerService?: string
+  trackingNumber: string
+  trackingLink?: string
+  dispatchDate: string
+  expectedDeliveryDate?: string
+  packageCount: number
+  grossWeightKg?: number
+  freightCharges?: number
+  freightPaymentMode: string
+  vehicleNumber?: string
+  driverName?: string
+  driverPhone?: string
+  challanNumber?: string
+  invoiceNumber?: string
+  ewayBillNumber?: string
+  shippingLabelRef?: string
+  status: string
+  remarks?: string
+  createdAt?: string
+  updatedAt?: string
+  items: ApiDispatchItem[]
+  timeline: ApiDispatchTimelineEvent[]
+}
+
+export const dispatchApi = {
+  getAll: () => apiClient.get<ApiDispatch[]>("/api/Dispatch/GetAll"),
+  getById: (id: number | string) => apiClient.get<ApiDispatch>(`/api/Dispatch/GetById/${id}`),
+  create: (data: Partial<ApiDispatch>) => apiClient.post<ApiDispatch>("/api/Dispatch/Create", data),
+  update: (id: number | string, data: ApiDispatch) => apiClient.put<ApiDispatch>(`/api/Dispatch/Update/${id}`, data),
+  updateStatus: (id: number | string, newStatus: string, remarks: string) =>
+    apiClient.put<void>(`/api/Dispatch/${id}/Status`, { newStatus, remarks }),
+  remove: (id: number | string) => apiClient.delete<void>(`/api/Dispatch/Delete/${id}`),
+}
+
+// ---------------------------------------------------------------------------
+// Country Master  →  /api/CountryMaster
+// ---------------------------------------------------------------------------
+
+export interface CountryMaster {
+  countryId: number
+  countryName: string
+  currencyType: string
+  paymentType: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export const countryMasterApi = {
+  getAll: () => apiClient.get<CountryMaster[]>("/api/CountryMaster/GetAll"),
+  getById: (id: number | string) => apiClient.get<CountryMaster>(`/api/CountryMaster/GetById/${id}`),
+  create: (data: Partial<CountryMaster>) => apiClient.post<CountryMaster>("/api/CountryMaster/Create", data),
+  update: (id: number | string, data: CountryMaster) => apiClient.put<CountryMaster>(`/api/CountryMaster/Update/${id}`, data),
+  remove: (id: number | string) => apiClient.delete<void>(`/api/CountryMaster/Delete/${id}`),
+}
+
+// ---------------------------------------------------------------------------
+// Stock Inward  →  /api/StockInward
+// ---------------------------------------------------------------------------
+
+import type { InwardOrder, InwardScanEvent, StatusUpdateDto, CreateStockInwardDto } from "@/app/inventory/stock-inward/types"
+
+export const stockInwardApi = {
+  getAll: () => apiClient.get<InwardOrder[]>("/api/StockInward/GetAll"),
+  getById: (id: number | string) => apiClient.get<InwardOrder>(`/api/StockInward/GetById/${id}`),
+  fromPurchaseOrder: (purchaseOrderId: number | string) =>
+    apiClient.get<any>(`/api/StockInward/FromPurchaseOrder/${purchaseOrderId}`),
+  create: (data: CreateStockInwardDto | Partial<InwardOrder>) => apiClient.post<InwardOrder>("/api/StockInward/Create", data),
+  update: (id: number | string, data: CreateStockInwardDto | Partial<InwardOrder>) => apiClient.put<InwardOrder>(`/api/StockInward/Update/${id}`, data),
+  updateStatus: (id: number | string, dto: StatusUpdateDto | { newStatus: string; status?: string; comments?: string; remarks?: string }) => {
+    const payload = {
+      newStatus: (dto as any).newStatus || (dto as any).status || "Completed",
+      status: (dto as any).newStatus || (dto as any).status || "Completed",
+      comments: dto.comments || (dto as any).remarks || "",
+      remarks: dto.comments || (dto as any).remarks || "",
+    }
+    return apiClient.put<void>(`/api/StockInward/${id}/Status`, payload)
+  },
+  scan: (id: number | string, event: InwardScanEvent) => apiClient.post<void>(`/api/StockInward/${id}/Scan`, event),
+  remove: (id: number | string) => apiClient.delete<void>(`/api/StockInward/Delete/${id}`),
+  generateLotNumber: (params: {
+    invoiceNumber?: string
+    orderNumber?: string
+    productId?: number
+    variantId?: number
+    sku?: string
+    itemIndex?: number
+    vendorId?: number
+    vendorPrefix?: string
+    date?: string
+    sequence?: number
+  }) => {
+    return inventoryLotsApi.generateLotNumber({
+      vendorId: params.vendorId,
+      vendorPrefix: params.vendorPrefix,
+      invoiceNumber: params.invoiceNumber || "",
+      productId: params.productId,
+      variantId: params.variantId,
+      date: params.date,
+      sequence: params.sequence ?? (params.itemIndex !== undefined ? params.itemIndex + 1 : undefined),
+    })
+  },
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Reports  →  /api/Report
+// ---------------------------------------------------------------------------
+
+export interface ReportFilterDto {
+  startDate?: string   // ISO date string e.g. "2025-01-01"
+  endDate?: string     // ISO date string e.g. "2025-12-31"
+  [key: string]: unknown  // allow any extra filter fields the backend may accept
+}
+
+export const reportsApi = {
+  /** POST /api/Report/sales */
+  getSales: (filter: ReportFilterDto) =>
+    apiClient.post<any>("/api/Report/sales", filter),
+
+  /** POST /api/Report/orders-outward */
+  getOrdersOutward: (filter: ReportFilterDto) =>
+    apiClient.post<any>("/api/Report/orders-outward", filter),
+
+  /** POST /api/Report/inventory-inward */
+  getInventoryInward: (filter: ReportFilterDto) =>
+    apiClient.post<any>("/api/Report/inventory-inward", filter),
+}
+
+// ---------------------------------------------------------------------------
+// Purchase Orders  →  /api/PurchaseOrder
+// ---------------------------------------------------------------------------
+
+import type {
+  PurchaseOrder,
+  PurchaseOrderItem,
+  CreatePurchaseOrderPayload,
+  PurchaseOrderApiResponse,
+  PurchaseOrderGetAllParams,
+} from "@/app/purchase/types"
+
+export const purchaseOrderApi = {
+  /** GET /api/PurchaseOrder/GetAll — Retrieve list of all purchase orders with optional filtering & pagination */
+  getAll: (params?: PurchaseOrderGetAllParams) => {
+    const query = new URLSearchParams()
+    if (params?.pageNumber) query.append("PageNumber", String(params.pageNumber))
+    if (params?.pageSize) query.append("PageSize", String(params.pageSize))
+    if (params?.searchTerm?.trim()) query.append("SearchTerm", params.searchTerm.trim())
+    if (params?.vendorId && String(params.vendorId) !== "all") query.append("VendorId", String(params.vendorId))
+    if (params?.orderStatus && params.orderStatus !== "all") query.append("OrderStatus", params.orderStatus)
+    if (params?.paymentStatus && params.paymentStatus !== "all") query.append("PaymentStatus", params.paymentStatus)
+    const queryString = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<PurchaseOrderApiResponse<PurchaseOrder[]>>(`/api/PurchaseOrder/GetAll${queryString}`)
+  },
+
+  /** GET /api/PurchaseOrder/{id} — Retrieve purchase order by ID */
+  getById: (id: number | string) =>
+    apiClient.get<PurchaseOrderApiResponse<PurchaseOrder>>(`/api/PurchaseOrder/${id}`),
+
+  /** POST /api/PurchaseOrder — Create a new purchase order */
+  create: (data: CreatePurchaseOrderPayload) =>
+    apiClient.post<PurchaseOrderApiResponse<PurchaseOrder>>("/api/PurchaseOrder", data),
+
+  /** PUT /api/PurchaseOrder/{id} — Update an existing purchase order */
+  update: (id: number | string, data: Partial<CreatePurchaseOrderPayload>) =>
+    apiClient.put<PurchaseOrderApiResponse<PurchaseOrder>>(`/api/PurchaseOrder/${id}`, data),
+
+  /** PUT /api/PurchaseOrder/{id}/Status — Update status of a purchase order */
+  updateStatus: (id: number | string, newStatus: string, remarks: string = "") =>
+    apiClient.put<any>(`/api/PurchaseOrder/${id}/Status`, {
+      newStatus,
+      remarks,
+      status: newStatus,
+      orderStatus: newStatus,
+    }),
+
+  /** DELETE /api/PurchaseOrder/{id} */
+  remove: (id: number | string) =>
+    apiClient.delete<void>(`/api/PurchaseOrder/${id}`),
+}
+
+// ---------------------------------------------------------------------------
+// Roles & Permissions  →  /api/Roles
+// ---------------------------------------------------------------------------
+
+export interface Role {
+  roleId: number
+  roleName: string
+  description?: string | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface CreateRolePayload {
+  roleName: string
+  description?: string
+}
+
+export interface UpdateRolePayload {
+  roleId: number
+  roleName: string
+  description?: string
+}
+
+export interface RolePermission {
+  permissionId: number
+  permissionName?: string
+  name?: string
+  module?: string
+  category?: string
+  description?: string
+  [key: string]: any
+}
+
+export interface RoleAuditLog {
+  logId?: number
+  id?: number
+  roleId?: number
+  roleName?: string
+  action?: string
+  performedBy?: string
+  user?: string
+  timestamp?: string
+  createdAt?: string
+  details?: string
+  [key: string]: any
+}
+
+export const rolesApi = {
+  /** GET /api/Roles/GetAll */
+  getAll: async (): Promise<Role[]> => {
+    try {
+      const res = await apiClient.get<any>("/api/Roles/GetAll")
+      if (Array.isArray(res)) return res
+      if (res?.data && Array.isArray(res.data)) return res.data
+      return []
+    } catch (err) {
+      console.error("Failed to fetch roles:", err)
+      throw err
+    }
+  },
+
+  /** GET /api/Roles/GetById/{id} */
+  getById: async (id: number | string): Promise<Role> => {
+    const res = await apiClient.get<any>(`/api/Roles/GetById/${id}`)
+    return res?.data ?? res
+  },
+
+  /** POST /api/Roles/Create */
+  create: async (data: CreateRolePayload): Promise<Role> => {
+    const payload = {
+      roleId: 0,
+      roleName: data.roleName.trim(),
+      description: data.description?.trim() || "",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+    const res = await apiClient.post<any>("/api/Roles/Create", payload)
+    return res?.data ?? res
+  },
+
+  /** PUT /api/Roles/Update/{id} */
+  update: async (id: number | string, data: UpdateRolePayload): Promise<Role> => {
+    const payload = {
+      roleId: Number(id),
+      roleName: data.roleName.trim(),
+      description: data.description?.trim() || "",
+      updatedAt: new Date().toISOString(),
+    }
+    const res = await apiClient.put<any>(`/api/Roles/Update/${id}`, payload)
+    return res?.data ?? res
+  },
+
+  /** DELETE /api/Roles/Delete/{id} */
+  delete: async (id: number | string): Promise<void> => {
+    return apiClient.delete<void>(`/api/Roles/Delete/${id}`)
+  },
+
+  /** GET /api/Roles/Permissions */
+  getPermissions: async (): Promise<RolePermission[]> => {
+    try {
+      const res = await apiClient.get<any>("/api/Roles/Permissions")
+      if (Array.isArray(res)) return res
+      if (res?.data && Array.isArray(res.data)) return res.data
+      return []
+    } catch (err) {
+      console.error("Failed to fetch permissions:", err)
+      throw err
+    }
+  },
+
+  /** GET /api/Roles/{roleId}/Permissions */
+  getRolePermissions: async (roleId: number | string): Promise<any[]> => {
+    try {
+      const res = await apiClient.get<any>(`/api/Roles/${roleId}/Permissions`)
+      if (Array.isArray(res)) return res
+      if (res?.data && Array.isArray(res.data)) return res.data
+      return []
+    } catch (err) {
+      console.error(`Failed to fetch permissions for role ${roleId}:`, err)
+      throw err
+    }
+  },
+
+  /** POST /api/Roles/{roleId}/AssignPermissions */
+  assignPermissions: async (roleId: number | string, permissionIds: number[]): Promise<any> => {
+    return apiClient.post<any>(`/api/Roles/${roleId}/AssignPermissions`, permissionIds)
+  },
+
+  /** GET /api/Roles/AuditLogs */
+  getAuditLogs: async (): Promise<RoleAuditLog[]> => {
+    try {
+      const res = await apiClient.get<any>("/api/Roles/AuditLogs")
+      if (Array.isArray(res)) return res
+      if (res?.data && Array.isArray(res.data)) return res.data
+      return []
+    } catch (err) {
+      console.error("Failed to fetch role audit logs:", err)
+      throw err
+    }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Credit Note (Goods Return)  →  /api/CreditNote
+// ---------------------------------------------------------------------------
+
+export interface CreditNoteGetAllParams {
+  PageNumber?: number
+  PageSize?: number
+  SearchTerm?: string
+}
+
+export const creditNoteApi = {
+  /** GET /api/CreditNote/GetAll */
+  getAll: async (params?: CreditNoteGetAllParams) => {
+    const query = new URLSearchParams()
+    if (params?.PageNumber) query.append("PageNumber", String(params.PageNumber))
+    if (params?.PageSize) query.append("PageSize", String(params.PageSize))
+    if (params?.SearchTerm && params.SearchTerm.trim()) query.append("SearchTerm", params.SearchTerm.trim())
+
+    const queryString = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<any>(`/api/CreditNote/GetAll${queryString}`)
+  },
+
+  /** GET /api/CreditNote/GetById/{id} */
+  getById: async (id: number | string) => {
+    return apiClient.get<any>(`/api/CreditNote/GetById/${id}`)
+  },
+
+  /** GET /api/CreditNote/ByClient/{clientId} */
+  getByClient: async (clientId: number | string) => {
+    return apiClient.get<any>(`/api/CreditNote/ByClient/${clientId}`)
+  },
+
+  /** GET /api/CreditNote/ByReturn/{returnId} */
+  getByReturn: async (returnId: number | string) => {
+    return apiClient.get<any>(`/api/CreditNote/ByReturn/${returnId}`)
+  },
+
+  /** POST /api/CreditNote/Create */
+  create: async (data: any) => {
+    return apiClient.post<any>("/api/CreditNote/Create", data)
+  },
+
+  /** PUT /api/CreditNote/Update/{id} */
+  update: async (id: number | string, data: any) => {
+    return apiClient.put<any>(`/api/CreditNote/Update/${id}`, data)
+  },
+  /** DELETE /api/CreditNote/Delete/{id} */
+  delete: async (id: number | string) => {
+    return apiClient.delete<any>(`/api/CreditNote/Delete/${id}`)
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Inventory Stock Transfers
+// ---------------------------------------------------------------------------
+export interface StockTransferItemDto {
+  productId: number
+  variantId: number
+  sku: string
+  quantity: number
+  unit: string
+}
+
+export interface CreateStockTransferDto {
+  date: string
+  reason: string
+  sourceWarehouseId: number
+  sourceStorageId: number
+  destinationWarehouseId: number
+  destinationStorageId: number
+  notes: string
+  items: StockTransferItemDto[]
+}
+
+export const stockTransfersApi = {
+  /** GET /api/Inventory/StockTransfers */
+  getAll: async () => {
+    return apiClient.get<any>("/api/Inventory/StockTransfers")
+  },
+
+  /** GET /api/Inventory/StockTransfers/{id} */
+  getById: async (id: number | string) => {
+    return apiClient.get<any>(`/api/Inventory/StockTransfers/${id}`)
+  },
+
+  /** POST /api/Inventory/StockTransfers */
+  create: async (payload: CreateStockTransferDto) => {
+    return apiClient.post<any>("/api/Inventory/StockTransfers", payload)
+  },
+
+  /** PATCH /api/Inventory/StockTransfers/{id}/status */
+  updateStatus: async (id: number | string, status: string) => {
+    return apiClient.patch<any>(`/api/Inventory/StockTransfers/${id}/status`, { status })
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Inventory Lots & Batches  →  /api/Inventory/Lots
+// ---------------------------------------------------------------------------
+
+export interface ProductLot {
+  lotId: number
+  lotNumber: string
+  productId: number
+  productName: string
+  variantId: number
+  variantName: string
+  skuSuffix?: string
+  warehouseId: number
+  warehouseName: string
+  rackLocation: string
+  initialQuantity: number
+  currentQuantity: number
+  reservedQuantity: number
+  availableQuantity: number
+  inwardDate: string
+  purchasePrice?: number
+  lotBarcode: string
+  inwardOrderId?: number
+  purchaseOrderId?: number | null
+  purchaseOrderItemId?: number | null
+  expiryDate?: string
+  status: "Pending" | "Active" | "Depleted" | "Expired" | string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface LotsQueryParams {
+  pageNumber?: number
+  pageSize?: number
+  warehouseId?: number | string
+  productId?: number | string
+  variantId?: number | string
+  status?: string
+  searchTerm?: string
+}
+
+export interface InventoryApiResponse<T> {
+  statusCode: number
+  success: boolean
+  message: string
+  data: T
+  totalCount?: number | null
+  error?: string | null
+}
+
+export interface GenerateLotNumberRequest {
+  vendorId?: number
+  vendorPrefix?: string
+  invoiceNumber?: string
+  productId?: number
+  variantId?: number
+  date?: string
+  sequence?: number
+}
+
+export interface GenerateLotNumberResponse {
+  lotNumber: string
+  lotBarcode: string
+  segments?: {
+    vendorPrefix?: string
+    invoiceNumber?: string
+    productId?: number
+    variantId?: number
+    productVariantCode?: string
+    dateCode?: string
+    sequence?: number
+  }
+}
+
+export const inventoryLotsApi = {
+  /** POST /api/Inventory/GenerateLotNumber (Phase 1) */
+  generateLotNumber: async (payload: GenerateLotNumberRequest): Promise<InventoryApiResponse<GenerateLotNumberResponse>> => {
+    const formattedDate = payload.date
+      ? (payload.date.includes("T") ? payload.date : new Date(payload.date).toISOString())
+      : new Date().toISOString()
+
+    const cleanPayload = {
+      vendorId: Number(payload.vendorId || 0),
+      vendorPrefix: typeof payload.vendorPrefix === "string" ? payload.vendorPrefix : "",
+      invoiceNumber: typeof payload.invoiceNumber === "string" ? payload.invoiceNumber : "",
+      productId: Number(payload.productId || 0),
+      variantId: Number(payload.variantId || 0),
+      date: formattedDate,
+      sequence: Number(payload.sequence ?? 1),
+    }
+
+    try {
+      return await apiClient.post<InventoryApiResponse<GenerateLotNumberResponse>>("/api/Inventory/GenerateLotNumber", cleanPayload)
+    } catch (postErr) {
+      // Fallback: try GET /api/Inventory/GenerateLotNumber with query params
+      const q = new URLSearchParams()
+      if (cleanPayload.vendorPrefix) q.append("vendorPrefix", cleanPayload.vendorPrefix)
+      if (cleanPayload.vendorId) q.append("vendorId", String(cleanPayload.vendorId))
+      if (cleanPayload.invoiceNumber) q.append("invoiceNumber", cleanPayload.invoiceNumber)
+      if (cleanPayload.productId) q.append("productId", String(cleanPayload.productId))
+      if (cleanPayload.variantId) q.append("variantId", String(cleanPayload.variantId))
+      if (cleanPayload.date) q.append("date", cleanPayload.date)
+      if (cleanPayload.sequence !== undefined) q.append("sequence", String(cleanPayload.sequence))
+      try {
+        return await apiClient.get<InventoryApiResponse<GenerateLotNumberResponse>>(`/api/Inventory/GenerateLotNumber?${q.toString()}`)
+      } catch {
+        throw postErr
+      }
+    }
+  },
+
+  /** GET /api/Inventory/Lots */
+  getAll: (params?: LotsQueryParams) => {
+    const query = new URLSearchParams()
+    if (params?.pageNumber) query.append("pageNumber", String(params.pageNumber))
+    if (params?.pageSize) query.append("pageSize", String(params.pageSize))
+    if (params?.warehouseId && String(params.warehouseId) !== "all") query.append("warehouseId", String(params.warehouseId))
+    if (params?.productId) query.append("productId", String(params.productId))
+    if (params?.variantId) query.append("variantId", String(params.variantId))
+    if (params?.status && params.status !== "all") query.append("status", params.status)
+    if (params?.searchTerm?.trim()) query.append("searchTerm", params.searchTerm.trim())
+    const qStr = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<InventoryApiResponse<ProductLot[]>>(`/api/Inventory/Lots${qStr}`)
+  },
+
+  /** GET /api/Inventory/Lots/{lotId} */
+  getById: (lotId: number | string) =>
+    apiClient.get<InventoryApiResponse<ProductLot>>(`/api/Inventory/Lots/${lotId}`),
+
+  /** GET /api/Inventory/Lots/ByVariant/{variantId} */
+  getByVariant: (variantId: number | string) =>
+    apiClient.get<InventoryApiResponse<ProductLot[]>>(`/api/Inventory/Lots/ByVariant/${variantId}`),
+
+  /** GET /api/Inventory/Lots/ByInwardOrder/{inwardOrderId} */
+  getByInwardOrder: (inwardOrderId: number | string) =>
+    apiClient.get<InventoryApiResponse<ProductLot[]>>(`/api/Inventory/Lots/ByInwardOrder/${inwardOrderId}`),
+
+  /** GET /api/Inventory/Lots/ByPurchaseOrder/{poId} */
+  getByPurchaseOrder: (poId: number | string) =>
+    apiClient.get<InventoryApiResponse<ProductLot[]>>(`/api/Inventory/Lots/ByPurchaseOrder/${poId}`),
+}
+
+// ---------------------------------------------------------------------------
+// Stock Movement Ledger Logs  →  /api/Inventory/StockLogs
+// ---------------------------------------------------------------------------
+
+export interface StockLog {
+  logId: number
+  transactionDate: string
+  transactionType: "INWARD" | "DISPATCH" | "TRANSFER_OUT" | "TRANSFER_IN" | "ADJUSTMENT" | "RETURN" | "OPENING_BALANCE" | string
+  productId: number
+  productName: string
+  variantId: number
+  variantName: string
+  skuSuffix?: string
+  lotId?: number
+  lotNumber?: string
+  warehouseId: number
+  warehouseName: string
+  quantityIn: number
+  quantityOut: number
+  quantityChange: number
+  balanceQuantity: number
+  referenceType: string
+  referenceId?: number
+  referenceNumber: string
+  unitPrice?: number
+  remarks?: string
+  createdBy?: number
+  createdByName?: string
+  createdAt?: string
+}
+
+export interface StockLogsQueryParams {
+  pageNumber?: number
+  pageSize?: number
+  warehouseId?: number | string
+  productId?: number | string
+  variantId?: number | string
+  lotId?: number | string
+  transactionType?: string
+  startDate?: string
+  endDate?: string
+}
+
+export const inventoryStockLogsApi = {
+  /** GET /api/Inventory/StockLogs */
+  getAll: (params?: StockLogsQueryParams) => {
+    const query = new URLSearchParams()
+    if (params?.pageNumber) query.append("pageNumber", String(params.pageNumber))
+    if (params?.pageSize) query.append("pageSize", String(params.pageSize))
+    if (params?.warehouseId && String(params.warehouseId) !== "all") query.append("warehouseId", String(params.warehouseId))
+    if (params?.productId) query.append("productId", String(params.productId))
+    if (params?.variantId) query.append("variantId", String(params.variantId))
+    if (params?.lotId) query.append("lotId", String(params.lotId))
+    if (params?.transactionType && params.transactionType !== "all") query.append("transactionType", params.transactionType)
+    if (params?.startDate) query.append("startDate", params.startDate)
+    if (params?.endDate) query.append("endDate", params.endDate)
+    const qStr = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<InventoryApiResponse<StockLog[]>>(`/api/Inventory/StockLogs${qStr}`)
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Accounts Invoicing Workflow  →  /api/Accounts
+// ---------------------------------------------------------------------------
+
+export interface InvoicingQueueParams {
+  pageNumber?: number
+  pageSize?: number
+  searchTerm?: string
+  startDate?: string
+  endDate?: string
+  includeInvoiced?: boolean
+}
+
+export interface InvoicingQueueItem {
+  orderId: number
+  orderNumber: string
+  clientId: number
+  clientName: string
+  orderDate: string
+  orderStatus: string
+  status?: string
+  paymentStatus?: string
+  paymentType?: string
+  currencyType?: string
+  subtotal: number
+  gstAmount: number
+  freight: number
+  totalAmount: number
+  invoiceNumber?: string | null
+  invoiceDate?: string | null
+  invoicedBy?: string | null
+  orderNotes?: string | null
+  outwardOrderId?: number | null
+  outwardStatus?: string | null
+  dispatchedDate?: string | null
+  itemsCount?: number
+}
+
+export interface GenerateInvoicePayload {
+  invoiceNumber: string
+  invoiceDate: string
+  freight?: number
+  roundOff?: number
+  remarks?: string
+}
+
+export interface CommercialAdjustPayload {
+  freight?: number
+  roundOff?: number
+  orderNotes?: string
+  shippingAddress?: string
+}
+
+export const accountsApi = {
+  /** GET /api/Accounts/InvoicingQueue */
+  getInvoicingQueue: async (params?: InvoicingQueueParams) => {
+    const query = new URLSearchParams()
+    if (params?.pageNumber) query.append("pageNumber", String(params.pageNumber))
+    if (params?.pageSize) query.append("pageSize", String(params.pageSize))
+    if (params?.searchTerm && params.searchTerm.trim()) query.append("searchTerm", params.searchTerm.trim())
+    if (params?.startDate) query.append("startDate", params.startDate)
+    if (params?.endDate) query.append("endDate", params.endDate)
+    if (params?.includeInvoiced !== undefined) query.append("includeInvoiced", String(params.includeInvoiced))
+
+    const qStr = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: InvoicingQueueItem[]
+      totalCount: number
+    }>(`/api/Accounts/InvoicingQueue${qStr}`)
+  },
+
+  /** GET /api/Accounts/SalesOrder/Completed */
+  getCompletedSalesOrders: async (params?: Omit<InvoicingQueueParams, "includeInvoiced">) => {
+    const query = new URLSearchParams()
+    if (params?.pageNumber) query.append("pageNumber", String(params.pageNumber))
+    if (params?.pageSize) query.append("pageSize", String(params.pageSize))
+    if (params?.searchTerm && params.searchTerm.trim()) query.append("searchTerm", params.searchTerm.trim())
+    if (params?.startDate) query.append("startDate", params.startDate)
+    if (params?.endDate) query.append("endDate", params.endDate)
+
+    const qStr = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: InvoicingQueueItem[]
+      totalCount: number
+    }>(`/api/Accounts/SalesOrder/Completed${qStr}`)
+  },
+
+  /** POST /api/Accounts/SalesOrder/{id}/GenerateInvoice */
+  generateInvoice: async (orderId: number | string, data: GenerateInvoicePayload) => {
+    return apiClient.post<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: {
+        orderId: number
+        orderNumber: string
+        invoiceNumber: string
+        invoiceDate: string
+        orderStatus: string
+      }
+    }>(`/api/Accounts/SalesOrder/${orderId}/GenerateInvoice`, data)
+  },
+
+  /** PUT /api/Accounts/SalesOrder/{id}/CommercialAdjust */
+  commercialAdjust: async (orderId: number | string, data: CommercialAdjustPayload) => {
+    return apiClient.put<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: any
+    }>(`/api/Accounts/SalesOrder/${orderId}/CommercialAdjust`, data)
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Return & Replacement Workflow  →  /api/Return
+// ---------------------------------------------------------------------------
+
+export interface ReturnReason {
+  reasonId: number
+  reasonCode: string
+  reasonText: string
+}
+
+export interface ReturnItemDto {
+  returnItemId?: number
+  productId: number
+  productName?: string
+  variantId: number
+  variantName?: string
+  lotId?: number | null
+  lotNumber?: string | null
+  returnQuantity: number
+  unitPrice: number
+  totalPrice?: number
+  itemCondition: "Restockable" | "Quarantine" | "Scrap" | string
+}
+
+export interface ReturnRequestDto {
+  returnId: number
+  returnNumber: string
+  orderId: number
+  orderNumber: string
+  clientId: number
+  clientName: string
+  warehouseId: number
+  warehouseName?: string
+  locationCode?: string
+  returnDate: string
+  reasonId: number
+  reasonText?: string
+  checkedBy: string
+  receivedBy: string
+  status: "Draft" | "Submitted" | "Approved" | "Rejected" | string
+  remarks?: string
+  creditNoteId?: number | null
+  creditNoteNumber?: string | null
+  totalReturnAmount: number
+  itemsCount: number
+  items: ReturnItemDto[]
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface CreateReturnPayload {
+  orderId: number
+  clientId: number
+  warehouseId: number
+  locationCode: string
+  returnDate: string
+  reasonId: number
+  checkedBy: string
+  receivedBy: string
+  status: "Draft" | "Submitted" | string
+  remarks?: string
+  items: {
+    productId: number
+    variantId: number
+    lotId?: number | null
+    lotNumber?: string | null
+    returnQuantity: number
+    unitPrice: number
+    itemCondition: "Restockable" | "Quarantine" | "Scrap" | string
+  }[]
+}
+
+export interface UpdateReturnPayload {
+  warehouseId: number
+  locationCode: string
+  reasonId: number
+  checkedBy: string
+  receivedBy: string
+  status: "Draft" | "Submitted" | string
+  remarks?: string
+  items: {
+    productId: number
+    variantId: number
+    lotId?: number | null
+    lotNumber?: string | null
+    returnQuantity: number
+    unitPrice: number
+    itemCondition: "Restockable" | "Quarantine" | "Scrap" | string
+  }[]
+}
+
+export interface ReturnGetAllParams {
+  pageNumber?: number
+  pageSize?: number
+  searchTerm?: string
+  status?: string
+  warehouseId?: number
+  startDate?: string
+  endDate?: string
+}
+
+export const returnApi = {
+  /** GET /api/Return/Reasons */
+  getReasons: async () => {
+    return apiClient.get<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: ReturnReason[]
+      totalCount: number
+    }>("/api/Return/Reasons")
+  },
+
+  /** POST /api/Return/Create */
+  create: async (data: CreateReturnPayload) => {
+    return apiClient.post<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: ReturnRequestDto
+    }>("/api/Return/Create", data)
+  },
+
+  /** PUT /api/Return/Update/{id} */
+  update: async (id: number | string, data: UpdateReturnPayload) => {
+    return apiClient.put<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: ReturnRequestDto
+    }>(`/api/Return/Update/${id}`, data)
+  },
+
+  /** GET /api/Return/GetAll */
+  getAll: async (params?: ReturnGetAllParams) => {
+    const query = new URLSearchParams()
+    if (params?.pageNumber) query.append("pageNumber", String(params.pageNumber))
+    if (params?.pageSize) query.append("pageSize", String(params.pageSize))
+    if (params?.searchTerm && params.searchTerm.trim()) query.append("searchTerm", params.searchTerm.trim())
+    if (params?.status && params.status !== "all") query.append("status", params.status)
+    if (params?.warehouseId && String(params.warehouseId) !== "all") query.append("warehouseId", String(params.warehouseId))
+    if (params?.startDate) query.append("startDate", params.startDate)
+    if (params?.endDate) query.append("endDate", params.endDate)
+
+    const qStr = query.toString() ? `?${query.toString()}` : ""
+    return apiClient.get<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: ReturnRequestDto[]
+      totalCount: number
+    }>(`/api/Return/GetAll${qStr}`)
+  },
+
+  /** GET /api/Return/GetById/{id} */
+  getById: async (id: number | string) => {
+    return apiClient.get<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: ReturnRequestDto
+    }>(`/api/Return/GetById/${id}`)
+  },
+
+  /** POST /api/Return/{id}/Approve */
+  approve: async (id: number | string, data?: { remarks?: string }) => {
+    return apiClient.post<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: {
+        returnId: number
+        returnNumber: string
+        status: string
+        creditNoteId: number
+        creditNoteNumber: string
+      }
+    }>(`/api/Return/${id}/Approve`, data || {})
+  },
+
+  /** POST /api/Return/{id}/Reject */
+  reject: async (id: number | string, data?: { remarks?: string }) => {
+    return apiClient.post<{
+      statusCode: number
+      success: boolean
+      message: string
+      data: any
+    }>(`/api/Return/${id}/Reject`, data || {})
+  },
+}
+
+
+
 

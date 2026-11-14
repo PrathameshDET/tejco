@@ -1,11 +1,11 @@
-"use client"
-
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useNavigate } from "react-router-dom"
 import {
   AlertCircle,
   CheckCircle2,
   ClipboardList,
+  ChevronDown,
+  ChevronRight,
   Filter,
   PackageCheck,
   Play,
@@ -29,9 +29,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { mockOutwardOrders } from "./mock-data"
-import { getOutwardProgress, type OutwardOrder, type OutwardStatus } from "./types"
+import { getOutwardProgress, mapApiOutwardOrder, mapApiOutwardOrderItem, mapApiOutwardScanEvent, type OutwardOrder, type OutwardOrderItem, type OutwardStatus } from "./types"
+import { orderOutwardApi, salesOrderApi, warehousesApi, productsApi } from "@/lib/api"
+import { mapApiSalesOrder } from "../../sales/orders/types"
 
 const tabFilters: Array<{ label: string; value: "all" | OutwardStatus }> = [
   { label: "All", value: "all" },
@@ -69,6 +69,70 @@ function getPriorityBadge(priority: OutwardOrder["priority"]) {
   }
 }
 
+function formatDate(dateStr?: string) {
+  if (!dateStr) return "—"
+  try {
+    const d = new Date(dateStr)
+    if (isNaN(d.getTime())) return String(dateStr).split("T")[0]
+    return d.toLocaleDateString("en-GB")
+  } catch {
+    return "—"
+  }
+}
+
+function createOutwardItems(
+  rawItems: any[],
+  barcodeMap: Map<string, any>,
+  productByIdMap: Map<number, any>,
+  variantByIdMap: Map<number, any>
+): OutwardOrderItem[] {
+  if (!Array.isArray(rawItems)) return []
+  return rawItems.map((item: any, idx: number) => {
+    const pId = Number(item.productId || 0)
+    const vId = Number(item.variantId || 0)
+    const skuLower = String(item.sku || "").toLowerCase().trim()
+    const resolved = barcodeMap.get(skuLower)
+    const resolvedProd = productByIdMap.get(pId)
+    const resolvedVar = variantByIdMap.get(vId) || (resolvedProd?.variants && Array.isArray(resolvedProd.variants) ? resolvedProd.variants[0] : null)
+
+    const rawProdName = String(item.productName || item.name || "").trim()
+    const isValidProdName = rawProdName && rawProdName !== "null" && rawProdName !== "na" && !rawProdName.startsWith("Product #")
+    const finalProdName = isValidProdName
+      ? rawProdName
+      : resolvedVar?.productName || resolvedProd?.name || resolvedProd?.productName || (rawProdName && rawProdName !== "null" && rawProdName !== "na" ? rawProdName : "") || `Product #${pId || idx + 1}`
+
+    const rawVarName = String(item.variantName || "").trim()
+    const isValidVarName = rawVarName && rawVarName !== "null" && rawVarName !== "na"
+    const finalVarName = isValidVarName
+      ? rawVarName
+      : resolvedVar?.variantName || resolvedVar?.name || ""
+
+    const rawSku = String(item.sku || "").trim()
+    const isValidSku = rawSku && rawSku !== "null" && rawSku !== "na"
+    const finalSku = isValidSku
+      ? rawSku
+      : resolvedVar?.sku || (resolvedProd?.baseSKU ? `${resolvedProd.baseSKU}${resolvedVar?.skuSuffix || ""}` : (pId ? `SKU-${pId}` : `SKU-ITEM-${idx + 1}`))
+
+    const rawBarcode = String(item.barcode || "").trim()
+    const isValidBarcode = rawBarcode && rawBarcode !== "null" && rawBarcode !== "na"
+    const finalBarcode = isValidBarcode
+      ? rawBarcode
+      : resolvedVar?.barcode || resolved?.barcode || (isValidSku ? rawSku : (pId ? `BC-${pId}` : `BC-${idx + 1}`))
+
+    return {
+      id: String(item.id || item.orderItemId || `item-${pId}-${idx}`),
+      productId: String(pId),
+      productName: finalProdName,
+      sku: finalSku,
+      barcode: finalBarcode,
+      variantName: finalVarName,
+      orderedQty: Number(item.quantity || item.orderedQty || 1),
+      scannedQty: Number(item.scannedQty || 0),
+      locationCode: item.locationCode || "A-1"
+    }
+  })
+}
+
 function DashboardStat({
   title,
   value,
@@ -82,14 +146,14 @@ function DashboardStat({
 }) {
   return (
     <Card>
-      <CardContent className="flex items-center justify-between p-5">
+      <CardContent className="flex items-center justify-between p-3.5">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
-          <p className="mt-2 text-2xl font-bold">{value}</p>
-          <p className="mt-1 text-xs text-muted-foreground">{description}</p>
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</p>
+          <p className="mt-1 text-xl font-bold">{value}</p>
+          <p className="text-[10px] text-muted-foreground mt-0.5">{description}</p>
         </div>
-        <div className="flex h-11 w-11 items-center justify-center rounded-lg border bg-muted/40">
-          <Icon className="h-5 w-5 text-primary" />
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg border bg-muted/30">
+          <Icon className="h-4.5 w-4.5 text-primary" />
         </div>
       </CardContent>
     </Card>
@@ -97,27 +161,215 @@ function DashboardStat({
 }
 
 export default function OrderOutwardPage() {
-  const router = useRouter()
-  const [orders] = React.useState<OutwardOrder[]>(mockOutwardOrders)
+  const navigate = useNavigate()
+  const [orders, setOrders] = React.useState<OutwardOrder[]>([])
+  const [isLoading, setIsLoading] = React.useState(true)
   const [activeTab, setActiveTab] = React.useState<"all" | OutwardStatus>("all")
   const [searchQuery, setSearchQuery] = React.useState("")
+  const [expandedOrders, setExpandedOrders] = React.useState<Record<string | number, boolean>>({})
 
-  const filteredOrders = orders.filter((order) => {
-    const matchesTab = activeTab === "all" || order.status === activeTab
-    const query = searchQuery.toLowerCase()
-    const matchesSearch =
-      order.orderNumber.toLowerCase().includes(query) ||
-      order.clientName.toLowerCase().includes(query) ||
-      order.warehouseName.toLowerCase().includes(query) ||
-      order.items.some((item) => item.sku.toLowerCase().includes(query) || item.barcode.includes(query))
+  const toggleOrderExpand = (orderId: string | number) => {
+    setExpandedOrders(prev => ({ ...prev, [orderId]: !prev[orderId] }))
+  }
 
-    return matchesTab && matchesSearch
-  })
+  const fetchOrders = React.useCallback(async () => {
+    setIsLoading(true)
+    try {
+      // Parallel fetch for Sales Orders, Products Catalog, Warehouses, and Outward Orders
+      const [resOrders, resProducts, resWarehouses, resOutward] = await Promise.all([
+        salesOrderApi.getAll({ Status: "Approved", PageSize: 500 }).catch((e) => {
+          console.error("Failed to fetch approved sales orders:", e)
+          return []
+        }),
+        productsApi.getAll().catch(() => []),
+        warehousesApi.getAll().catch(() => []),
+        orderOutwardApi.getAll().catch(() => [])
+      ])
+
+      let rawList: any[] = []
+      if (Array.isArray(resOrders)) {
+        rawList = resOrders
+      } else if (resOrders?.data && Array.isArray(resOrders.data)) {
+        rawList = resOrders.data
+      } else if (resOrders?.items && Array.isArray(resOrders.items)) {
+        rawList = resOrders.items
+      }
+
+      // Fallback: If Status=Approved returned empty, fetch general list
+      if (rawList.length === 0) {
+        try {
+          const fallbackRes = await salesOrderApi.getAll({ PageSize: 500 })
+          if (Array.isArray(fallbackRes)) {
+            rawList = fallbackRes
+          } else if (fallbackRes?.data && Array.isArray(fallbackRes.data)) {
+            rawList = fallbackRes.data
+          } else if (fallbackRes?.items && Array.isArray(fallbackRes.items)) {
+            rawList = fallbackRes.items
+          }
+        } catch (e) {
+          console.warn("Fallback sales order fetch failed:", e)
+        }
+      }
+
+      const mappedOrders = rawList.map((order) => mapApiSalesOrder(order))
+      // Every order returned by Status=Approved API call is an approved sales order
+      const approvedOrders = mappedOrders
+
+      // Process product catalog to map SKU to Barcode
+      const productCatalog = Array.isArray(resProducts) ? resProducts : (Array.isArray((resProducts as any)?.data) ? (resProducts as any).data : [])
+      const productByIdMap = new Map<number, any>()
+      const variantByIdMap = new Map<number, any>()
+      const barcodeMap = new Map<string, { barcode: string; variantName: string; productName: string }>()
+      productCatalog.forEach((prod: any) => {
+        const pId = Number(prod.id || prod.productId || 0)
+        if (pId) productByIdMap.set(pId, prod)
+
+        if (prod.variants && Array.isArray(prod.variants)) {
+          prod.variants.forEach((v: any) => {
+            const vId = Number(v.id || v.variantId || 0)
+            if (vId) variantByIdMap.set(vId, { ...v, productName: prod.name || prod.productName })
+
+            const sku = `${prod.baseSKU || ""}${v.skuSuffix || ""}`
+            if (sku) {
+              barcodeMap.set(sku.toLowerCase(), {
+                barcode: v.barcode || v.sku || sku,
+                variantName: v.variantName || "",
+                productName: prod.name || prod.productName || ""
+              })
+            }
+          })
+        }
+      })
+
+      // Select first active warehouse or use fallback
+      const rawWarehouses = Array.isArray(resWarehouses) ? resWarehouses : ((resWarehouses as any)?.data || [])
+      const defaultWarehouse = rawWarehouses.find((w: any) => w.status === "Active") || rawWarehouses[0]
+      const whName = defaultWarehouse?.name || "Main Warehouse"
+      const whCode = defaultWarehouse?.id ? `WH-${defaultWarehouse.id}` : "M-WH"
+
+      // Process outward orders list from DB
+      const rawOutwardList = Array.isArray(resOutward) ? resOutward : ((resOutward as any)?.data && Array.isArray((resOutward as any).data) ? (resOutward as any).data : [])
+      const outwardOrders: OutwardOrder[] = []
+      const processedOrderIds = new Set<number>()
+
+      // 1. Add all approved Sales Orders first
+      approvedOrders.forEach((order: any) => {
+        const oId = Number(order.orderId || order.id || 0)
+        if (oId) processedOrderIds.add(oId)
+
+        const items = createOutwardItems(order.items, barcodeMap, productByIdMap, variantByIdMap)
+        const existingOutward = rawOutwardList.find((out: any) => Number(out.orderId) === oId)
+
+        let resolvedStatus: OutwardStatus = "Ready"
+        let scanHistory: any[] = []
+        let resolvedItems = items
+
+        if (existingOutward) {
+          try {
+            const mappedOutward = mapApiOutwardOrder(existingOutward)
+            resolvedStatus = mappedOutward.status
+            scanHistory = mappedOutward.scanHistory || []
+            if (mappedOutward.items && mappedOutward.items.length > 0) {
+              resolvedItems = mappedOutward.items
+            }
+          } catch (e) {
+            console.warn("Failed to parse existing outward record:", e)
+          }
+        }
+
+        outwardOrders.push({
+          id: String(existingOutward?.outwardOrderId || order.orderId || order.id),
+          outwardOrderId: existingOutward?.outwardOrderId,
+          orderId: oId,
+          orderNumber: order.orderNumber || `SO-${order.id}`,
+          clientName: order.clientName || "Unknown Client",
+          warehouseName: existingOutward?.warehouseName || whName,
+          warehouseCode: existingOutward?.warehouseCode || whCode,
+          shippingAddress: order.shippingAddress || order.billingAddress || existingOutward?.shippingAddress || "",
+          orderDate: order.date || new Date().toISOString(),
+          promisedDate: order.deliveryDate || order.date || new Date().toISOString(),
+          status: resolvedStatus,
+          priority: "Normal",
+          items: resolvedItems,
+          scanHistory
+        })
+      })
+
+      // 2. Add any standalone outward orders from DB not linked to fetched approved sales orders
+      rawOutwardList.forEach((out: any) => {
+        try {
+          const oId = Number(out.orderId || 0)
+          if (!processedOrderIds.has(oId) && out.outwardOrderId) {
+            const mapped = mapApiOutwardOrder(out)
+            if (mapped && mapped.id) {
+              outwardOrders.push(mapped)
+              if (oId) processedOrderIds.add(oId)
+            }
+          }
+        } catch (e) {
+          console.warn("Failed to map outward order:", e)
+        }
+      })
+
+      setOrders(outwardOrders)
+    } catch (err) {
+      console.error("Failed to load outward orders from approved sales orders:", err)
+      setOrders([])
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    fetchOrders()
+  }, [fetchOrders])
+
+  const filteredOrders = React.useMemo(() => {
+    return orders.filter((order) => {
+      if (!order) return false
+      const matchesTab = activeTab === "all" || order.status === activeTab
+      const query = (searchQuery || "").toLowerCase().trim()
+      if (!query) return matchesTab
+
+      const orderNumber = String(order.orderNumber || "").toLowerCase()
+      const clientName = String(order.clientName || "").toLowerCase()
+      const warehouseName = String(order.warehouseName || "").toLowerCase()
+      const itemsMatch = Array.isArray(order.items) && order.items.some((item) => {
+        if (!item) return false
+        const sku = String(item.sku || "").toLowerCase()
+        const barcode = String(item.barcode || "").toLowerCase()
+        const prodName = String(item.productName || "").toLowerCase()
+        return sku.includes(query) || barcode.includes(query) || prodName.includes(query)
+      })
+
+      const matchesSearch =
+        orderNumber.includes(query) ||
+        clientName.includes(query) ||
+        warehouseName.includes(query) ||
+        itemsMatch
+
+      return matchesTab && matchesSearch
+    })
+  }, [orders, activeTab, searchQuery])
 
   const readyCount = orders.filter((order) => order.status === "Ready").length
   const exceptionCount = orders.filter((order) => order.status === "Exception").length
   const completedCount = orders.filter((order) => order.status === "Completed").length
   const pendingUnits = orders.reduce((sum, order) => sum + getOutwardProgress(order).pendingQty, 0)
+
+  const nextReadyOrderId = orders.find((order) => order.status === "Ready" || order.status === "Pending")?.id
+
+  // Group orders by orderId
+  const groupedOrdersMap = React.useMemo(() => {
+    const map = new Map<number | string, OutwardOrder[]>()
+    filteredOrders.forEach((order) => {
+      const key = order.orderId || order.id || `order-${Math.random()}`
+      const list = map.get(key) || []
+      list.push(order)
+      map.set(key, list)
+    })
+    return map
+  }, [filteredOrders])
 
   return (
     <div className="flex flex-col gap-6">
@@ -135,11 +387,15 @@ export default function OrderOutwardPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" className="gap-2">
-            <RefreshCw className="h-4 w-4" />
+          <Button variant="outline" className="gap-2" onClick={fetchOrders} disabled={isLoading}>
+            <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
             Refresh
           </Button>
-          <Button className="gap-2" onClick={() => router.push("/inventory/order-outward/ord-9281")}>
+          <Button 
+            className="gap-2" 
+            onClick={() => navigate(`/inventory/order-outward/${nextReadyOrderId}`)}
+            disabled={!nextReadyOrderId}
+          >
             <Play className="h-4 w-4" />
             Start Next
           </Button>
@@ -153,19 +409,23 @@ export default function OrderOutwardPage() {
         <DashboardStat title="Exceptions" value={String(exceptionCount)} description="Need warehouse review" icon={AlertCircle} />
       </div>
 
-      <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as "all" | OutwardStatus)} className="w-full">
+      <div className="w-full">
         <div className="flex flex-col gap-4 border-b pb-4 lg:flex-row lg:items-center lg:justify-between">
-          <TabsList className="h-auto gap-6 bg-transparent p-0">
+          <div className="flex items-center gap-6">
             {tabFilters.map((tab) => (
-              <TabsTrigger
+              <button
                 key={tab.value}
-                value={tab.value}
-                className="rounded-none px-0 py-2 data-[state=active]:border-b-2 data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                onClick={() => setActiveTab(tab.value)}
+                className={`pb-2 text-sm font-medium transition-colors border-b-2 ${
+                  activeTab === tab.value
+                    ? "border-primary text-primary"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                }`}
               >
                 {tab.label}
-              </TabsTrigger>
+              </button>
             ))}
-          </TabsList>
+          </div>
           <div className="flex items-center gap-2">
             <div className="relative w-full sm:w-[280px]">
               <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -182,9 +442,9 @@ export default function OrderOutwardPage() {
           </div>
         </div>
 
-        <TabsContent value={activeTab} className="mt-6">
+        <div className="mt-6">
           <Card>
-            <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between py-4">
               <div>
                 <CardTitle className="text-lg">Outward Queue</CardTitle>
                 <CardDescription>Orders shown here are ready for warehouse processing.</CardDescription>
@@ -194,7 +454,7 @@ export default function OrderOutwardPage() {
                 Multi-warehouse queue
               </div>
             </CardHeader>
-            <CardContent>
+            <CardContent className="py-4">
               <Table>
                 <TableHeader className="bg-muted/50">
                   <TableRow>
@@ -209,64 +469,191 @@ export default function OrderOutwardPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredOrders.length === 0 ? (
+                  {isLoading ? (
+                    <TableRow>
+                      <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
+                        <div className="flex items-center justify-center gap-2">
+                          <RefreshCw className="h-4 w-4 animate-spin" />
+                          Loading outward orders...
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ) : filteredOrders.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={8} className="h-24 text-center text-muted-foreground">
                         No outward orders match the current filters.
                       </TableCell>
                     </TableRow>
                   ) : (
-                    filteredOrders.map((order) => {
-                      const progress = getOutwardProgress(order)
+                    Array.from(groupedOrdersMap.entries()).map(([orderId, runs]) => {
+                      const representative = runs[0]
+                      const isExpanded = !!expandedOrders[orderId]
+                      const hasMultipleRuns = runs.length > 1
 
-                      return (
-                        <TableRow key={order.id}>
-                          <TableCell>
-                            <div className="font-semibold text-primary">{order.orderNumber}</div>
-                            <div className="text-xs text-muted-foreground">
-                              {new Date(order.orderDate).toLocaleDateString("en-GB")}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="font-medium">{order.clientName}</div>
-                            <div className="line-clamp-1 max-w-[260px] text-xs text-muted-foreground">
-                              {order.shippingAddress}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex items-center gap-2">
-                              <Warehouse className="h-4 w-4 text-muted-foreground" />
-                              <div>
-                                <div className="text-sm font-medium">{order.warehouseCode}</div>
-                                <div className="text-xs text-muted-foreground">{order.warehouseName}</div>
+                      if (!hasMultipleRuns) {
+                        const order = representative
+                        const progress = getOutwardProgress(order)
+                        return (
+                          <TableRow key={order.id}>
+                            <TableCell>
+                              <div className="font-semibold text-primary">
+                                {order.orderNumber} <span className="text-xs text-muted-foreground font-normal">(ID: {order.orderId})</span>
                               </div>
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <Progress value={progress.percent} className="w-[180px]">
-                              <ProgressLabel>{progress.scannedQty}/{progress.totalQty} units</ProgressLabel>
-                              <span className="ml-auto text-sm text-muted-foreground tabular-nums">{progress.percent}%</span>
-                            </Progress>
-                          </TableCell>
-                          <TableCell>{new Date(order.promisedDate).toLocaleDateString("en-GB")}</TableCell>
-                          <TableCell>{getPriorityBadge(order.priority)}</TableCell>
-                          <TableCell>{getStatusBadge(order.status)}</TableCell>
-                          <TableCell className="text-right">
-                            <Button
-                              size="sm"
-                              variant={order.status === "Completed" ? "outline" : "default"}
-                              className="gap-2"
-                              onClick={() => router.push(`/inventory/order-outward/${order.id}`)}
-                            >
-                              {order.status === "Completed" ? (
-                                <CheckCircle2 className="h-4 w-4" />
-                              ) : (
-                                <Truck className="h-4 w-4" />
-                              )}
-                              {order.status === "Completed" ? "Review" : "Start Outscan"}
-                            </Button>
-                          </TableCell>
-                        </TableRow>
+                              <div className="text-xs text-muted-foreground">
+                                {formatDate(order.orderDate)}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="font-medium">{order.clientName}</div>
+                              <div className="line-clamp-1 max-w-[260px] text-xs text-muted-foreground">
+                                {order.shippingAddress}
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center gap-2">
+                                <Warehouse className="h-4 w-4 text-muted-foreground" />
+                                <div>
+                                  <div className="text-sm font-medium">{order.warehouseCode}</div>
+                                  <div className="text-xs text-muted-foreground">{order.warehouseName}</div>
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <Progress value={progress.percent} className="w-[180px]">
+                                <ProgressLabel>{progress.scannedQty}/{progress.totalQty} units</ProgressLabel>
+                                <span className="ml-auto text-sm text-muted-foreground tabular-nums">{progress.percent}%</span>
+                              </Progress>
+                            </TableCell>
+                            <TableCell>{formatDate(order.promisedDate)}</TableCell>
+                            <TableCell>{getPriorityBadge(order.priority)}</TableCell>
+                            <TableCell>{getStatusBadge(order.status)}</TableCell>
+                            <TableCell className="text-right">
+                              <Button
+                                size="sm"
+                                variant={order.status === "Completed" ? "outline" : "default"}
+                                className="gap-2"
+                                disabled={isLoading}
+                                onClick={async () => {
+                                  navigate(`/inventory/order-outward/${order.id}`)
+                                }}
+                              >
+                                {order.status === "Completed" ? (
+                                  <CheckCircle2 className="h-4 w-4" />
+                                ) : (
+                                  <Truck className="h-4 w-4" />
+                                )}
+                                {order.status === "Completed" ? "Review" : "Start Outscan"}
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      }
+
+                      // Render grouped rows
+                      return (
+                        <React.Fragment key={orderId}>
+                          <TableRow className="bg-muted/30 font-medium hover:bg-muted/40 border-l-4 border-l-primary">
+                            <TableCell>
+                              <div className="flex items-center gap-2">
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-8 w-8 p-0"
+                                  onClick={() => toggleOrderExpand(orderId)}
+                                >
+                                  {isExpanded ? (
+                                    <ChevronDown className="h-4 w-4" />
+                                  ) : (
+                                    <ChevronRight className="h-4 w-4" />
+                                  )}
+                                </Button>
+                                <div>
+                                  <div className="font-semibold text-primary">
+                                    {representative.orderNumber} <span className="text-xs text-muted-foreground font-normal">(ID: {representative.orderId})</span>
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    {formatDate(representative.orderDate)}
+                                  </div>
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="font-medium">{representative.clientName}</div>
+                              <div className="line-clamp-1 max-w-[260px] text-xs text-muted-foreground">
+                                {representative.shippingAddress}
+                              </div>
+                            </TableCell>
+                            <TableCell colSpan={2}>
+                              <div className="flex items-center gap-2">
+                                <Badge className="bg-primary/10 text-primary hover:bg-primary/20 border-primary/20">
+                                  {runs.length} Outward Runs
+                                </Badge>
+                              </div>
+                            </TableCell>
+                            <TableCell>{formatDate(representative.promisedDate)}</TableCell>
+                            <TableCell>{getPriorityBadge(representative.priority)}</TableCell>
+                            <TableCell>
+                              <Badge variant="outline" className="bg-background">Batch Group</Badge>
+                            </TableCell>
+                            <TableCell className="text-right">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-8 text-xs font-semibold text-primary"
+                                onClick={() => toggleOrderExpand(orderId)}
+                              >
+                                {isExpanded ? "Hide Runs" : "Show Runs"}
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+
+                          {isExpanded && runs.map((order, runIdx) => {
+                            const progress = getOutwardProgress(order)
+                            return (
+                              <TableRow key={order.id} className="bg-muted/10 border-l-4 border-l-primary/40 hover:bg-muted/15">
+                                <TableCell className="pl-12">
+                                  <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                                    Run #{runs.length - runIdx} (ID: {order.id})
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="text-xs text-muted-foreground">
+                                    Warehouse: <span className="font-medium text-foreground">{order.warehouseCode}</span>
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="text-xs text-muted-foreground line-clamp-1">{order.warehouseName}</div>
+                                </TableCell>
+                                <TableCell>
+                                  <Progress value={progress.percent} className="w-[180px]">
+                                    <ProgressLabel>{progress.scannedQty}/{progress.totalQty} units</ProgressLabel>
+                                    <span className="ml-auto text-xs text-muted-foreground tabular-nums">{progress.percent}%</span>
+                                  </Progress>
+                                </TableCell>
+                                <TableCell colSpan={2} />
+                                <TableCell>{getStatusBadge(order.status)}</TableCell>
+                                <TableCell className="text-right">
+                                  <Button
+                                    size="sm"
+                                    variant={order.status === "Completed" ? "outline" : "default"}
+                                    className="gap-2 h-8 text-xs"
+                                    disabled={isLoading}
+                                    onClick={async () => {
+                                      navigate(`/inventory/order-outward/${order.id}`)
+                                    }}
+                                  >
+                                    {order.status === "Completed" ? (
+                                      <CheckCircle2 className="h-3.5 w-3.5" />
+                                    ) : (
+                                      <Truck className="h-3.5 w-3.5" />
+                                    )}
+                                    {order.status === "Completed" ? "Review" : "Start Outscan"}
+                                  </Button>
+                                </TableCell>
+                              </TableRow>
+                            )
+                          })}
+                        </React.Fragment>
                       )
                     })
                   )}
@@ -274,8 +661,8 @@ export default function OrderOutwardPage() {
               </Table>
             </CardContent>
           </Card>
-        </TabsContent>
-      </Tabs>
+        </div>
+      </div>
     </div>
   )
 }
